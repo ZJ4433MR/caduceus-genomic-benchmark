@@ -1,0 +1,7 @@
+dataset,task_group,input_length,task_type,metrics,role,availability
+hg38,masked_language_modeling,1024,pretraining,loss,MLBN-1k pretraining,download_script
+GenomicBenchmarks,legacy_downstream,variable,binary_or_multiclass_classification,accuracy,legacy comparison,public_package
+Caduceus_VEP,long_range_legacy,30000_to_131072,variant_effect_prediction,AUROC_or_task_metric,long-range legacy comparison,public_huggingface_dataset
+DNALongBench_eQTL,long_range_external,450000,binary_classification,AUROC,external validation,public_benchmark
+DNALongBench_ETGP,long_range_external,450000,binary_classification,AUROC_and_AUPRC,external validation,public_benchmark
+

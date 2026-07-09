@@ -1,0 +1,20 @@
+# MLBN language model used for hg38 pre-training before GenomicBenchmarks.
+# Keep this architecture aligned with configs/model/mlbn_dna.yaml so the
+# pre-trained backbone can be loaded into the downstream classifier. This small
+# setting is used for the parameter-matched comparison against PS/PH small.
+_name_: mlbn_lm
+vocab_size: 12
+d_model: 80
+n_layer: 3
+kernel_size: 4
+d_state: 16
+d_conv: 4
+expand: 2
+head_dim: 16
+dropout_rate1: 0.0
+num_heads: 4
+dropout_rate2: 0.0
+drop_path_rate: 0.0
+embed_dropout: 0.0
+pad_token_id: 4
+tie_embeddings: true
