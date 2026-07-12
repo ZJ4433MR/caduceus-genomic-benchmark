@@ -59,6 +59,23 @@ Full pretraining and 450 kb long-range finetuning require GPU resources and are
 normally launched through the scripts in `slurm_scripts/`. The commands and
 expected result formats are described in `REPRODUCE.md`.
 
+## Ablation Handoff
+
+For the teammate implementing and running the MLBN ablations, start with
+[`ABLATION_HANDOFF.md`](ABLATION_HANDOFF.md). It documents:
+
+- the exact baseline code and configuration files;
+- the required structural ablations and their code locations;
+- checkpoint rules for structural and inference-only ablations;
+- a low-cost three-seed screening stage and five-seed final stage;
+- Slurm command templates for pretraining, downstream training, and paired
+  normal/flipped evaluation;
+- the required result schema and handoff checklist.
+
+This branch intentionally contains code and lightweight configuration only.
+Datasets, checkpoints, caches, generated outputs, and local cluster paths must
+be shared separately and must not be committed to Git.
+
 ## What Is Not Included
 
 The archive does not include large raw genomic datasets, pretrained checkpoint
@@ -68,4 +85,3 @@ documented in `checkpoints/README.md`.
 
 No author names, affiliations, private usernames, private GitHub URLs, or local
 absolute paths are intentionally included in this branch.
-

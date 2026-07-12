@@ -3,6 +3,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .cache/
+.codex_tmp/
+.tmp/
+tmp/
+_gb_sequence_cache_download/
 .venv/
 *.pyc
 *.pyo
@@ -28,6 +32,11 @@ lightning_logs/
 *.parquet
 *.pkl
 *.pickle
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bz2
 data/hg38/
 data/dnalongbench/
 data/genomic_benchmarks/
