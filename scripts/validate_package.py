@@ -50,7 +50,7 @@ REQUIRED = (
     "configs/model/flipped_gari_etgp.yaml",
     "results/processed/genomicbenchmarks/main_table.csv",
     "results/processed/vep/main_table.csv",
-    "results/processed/etgp/main_table_as_submitted.csv",
+    "results/processed/etgp/main_table.csv",
     "scripts/build_anonymous_archive.py",
     "scripts/launch/pretrain_flipped_gari.sh",
     "scripts/launch/run_genomicbenchmarks.sh",

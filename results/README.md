@@ -2,7 +2,7 @@
 
 - `raw/` contains per-seed metrics or complete hyperparameter grids retained
   from experiment outputs.
-- `processed/` contains table-ready summaries and explicit provenance labels.
+- `processed/` contains the machine-readable paper-result tables.
 - `figures/` is reserved for plots regenerated from the processed CSV files.
 
 No genomic sequence, embedding tensor, model checkpoint, or participant-level

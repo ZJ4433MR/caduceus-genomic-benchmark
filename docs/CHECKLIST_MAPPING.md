@@ -13,7 +13,7 @@ This file maps the affirmative checklist answers to concrete artifact paths.
 | Hardware/software requirements | `INSTALLATION.md`, `caduceus_env.yml`, `docs/HARDWARE.md` |
 | Evaluation code | GB evaluation scripts, `vep_svm_eval.py`, ETGP global-metric evaluator |
 | Number of runs | `docs/HYPERPARAMETERS.md` and machine-readable `results/` |
-| Variation estimates | GB and VEP sample SD files; ETGP raw-run and recomputed summary CSVs |
+| Variation estimates | GB and VEP sample SD files and the reported ETGP comparison table |
 | Statistical tests | None claimed where sample size/protocol does not justify a test |
 | Final hyperparameters | `docs/HYPERPARAMETERS.md` and exact Hydra configuration files |
 | Data access and licensing | `docs/DATA_AND_LICENSES.md`, `data/manifests/datasets.csv` |

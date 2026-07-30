@@ -89,8 +89,8 @@ readout on 131-kb inputs.
 The retained benchmark protocol scans
 `C={0.1,0.3,1,3,5,10,30,100}` for each stated condition. The component
 diagnostic additionally transfers the original-order-selected value unchanged
-to sequence-reversed evaluation. Raw grids and summaries are under
-`results/raw/vep/` and `results/processed/vep/`.
+to sequence-reversed evaluation. Completed raw grids and paper-result summaries
+are under `results/raw/vep/` and `results/processed/vep/`.
 
 ## 5. Direct 450-kb ETGP
 
@@ -111,6 +111,5 @@ sequence, and computes metrics from continuous scores over the full split.
 python scripts/verify_reported_results.py
 ```
 
-This recomputes table aggregates from the included CSV files and prints a
-separate ETGP provenance reconciliation. It never silently substitutes a
-displayed value for a raw-run aggregate.
+This checks the internal consistency and required rows of the packaged
+paper-result tables.

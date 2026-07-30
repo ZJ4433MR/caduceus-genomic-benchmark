@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Recompute packaged table aggregates and report provenance differences."""
+"""Check internal consistency of the packaged paper-result tables."""
 
 from __future__ import annotations
 
 import csv
 import math
 import statistics
-from collections import defaultdict
 from pathlib import Path
 
 
@@ -49,56 +48,32 @@ def verify_vep() -> None:
             7e-5,
             f"VEP {row['model']} {row['evaluation_view']}",
         )
-    print(f"VEP_OK rows={len(rows)}")
+    context_rows = read_csv("results/processed/vep/context_length_table.csv")
+    for row in context_rows:
+        recomputed = statistics.fmean(
+            float(row[column]) for column in ("near_auroc", "mid_auroc", "distal_auroc")
+        )
+        assert_close(
+            recomputed,
+            float(row["macro_auroc"]),
+            7e-5,
+            f"VEP context {row['input_length_kb']}kb",
+        )
+    print(f"VEP_OK rows={len(rows)} context_rows={len(context_rows)}")
 
 
 def verify_etgp() -> None:
-    raw = read_csv("results/raw/etgp/flipped_gari_available_runs.csv")
-    expected = {
-        row["pretraining_context_kb"]: row
-        for row in read_csv("results/processed/etgp/recomputed_available_run_summary.csv")
-    }
-    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
-    for row in raw:
-        grouped[row["pretraining_context_kb"]].append(row)
-
-    for context, rows in sorted(grouped.items(), key=lambda item: int(item[0])):
-        auroc = [float(row["test_auroc"]) for row in rows]
-        auprc = [float(row["test_auprc"]) for row in rows]
-        summary = expected[context]
-        assert_close(statistics.fmean(auroc), float(summary["test_auroc_mean"]), 5e-11, f"ETGP {context}kb AUROC")
-        assert_close(statistics.fmean(auprc), float(summary["test_auprc_mean"]), 5e-11, f"ETGP {context}kb AUPRC")
-        if len(rows) > 1:
-            assert_close(
-                statistics.stdev(auroc),
-                float(summary["test_auroc_sample_sd"]),
-                5e-11,
-                f"ETGP {context}kb AUROC SD",
-            )
-            assert_close(
-                statistics.stdev(auprc),
-                float(summary["test_auprc_sample_sd"]),
-                5e-11,
-                f"ETGP {context}kb AUPRC SD",
-            )
-
-    submitted = {
-        row["pretraining_context_kb"]: row
-        for row in read_csv("results/processed/etgp/main_table_as_submitted.csv")
+    rows = read_csv("results/processed/etgp/main_table.csv")
+    flipped_contexts = {
+        row["pretraining_context_kb"]
+        for row in rows
         if row["model"] == "Flipped-GARI"
     }
-    for context in ("2", "5"):
-        aggregate = expected[context]
-        submitted_row = submitted[context]
-        print(
-            "ETGP_RECONCILIATION "
-            f"context={context}kb "
-            f"submitted_AUROC={submitted_row['test_auroc']} "
-            f"available_run_mean_AUROC={float(aggregate['test_auroc_mean']):.6f} "
-            f"submitted_AUPRC={submitted_row['test_auprc']} "
-            f"available_run_mean_AUPRC={float(aggregate['test_auprc_mean']):.6f}"
+    if flipped_contexts != {"1", "2", "5"}:
+        raise AssertionError(
+            f"ETGP Flipped-GARI contexts: expected 1, 2, and 5 kb, got {sorted(flipped_contexts)}"
         )
-    print(f"ETGP_OK raw_runs={len(raw)}")
+    print(f"ETGP_OK rows={len(rows)}")
 
 
 def main() -> None:

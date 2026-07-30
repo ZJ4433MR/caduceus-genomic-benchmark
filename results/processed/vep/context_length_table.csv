@@ -1,0 +1,4 @@
+input_length_kb,near_auroc,mid_auroc,distal_auroc,macro_auroc
+1,0.6653,0.6128,0.5774,0.6185
+16,0.6635,0.5878,0.6144,0.6219
+131,0.6573,0.6308,0.6416,0.6432
