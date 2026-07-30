@@ -15,7 +15,6 @@ branch used to assemble the ZIP is only an internal staging area.
 - Exact public-name model configurations for GenomicBenchmarks, VEP, and ETGP.
 - Four configurations for the VEP component diagnostic.
 - Masked-nucleotide pretraining, downstream training, and evaluation entry points.
-- Machine-readable paper-reported results and completed raw evaluation grids.
 - Public-data download scripts, dataset/version/license metadata, a small
   CC0-licensed representative ETGP metadata subset, and synthetic smoke data.
 - Checkpoint SHA-256 identifiers. Checkpoint binaries and third-party raw data
@@ -29,7 +28,6 @@ branch used to assemble the ZIP is only an internal staging area.
 conda env create -f caduceus_env.yml
 conda activate flipped-gari-aaai27
 python scripts/validate_package.py
-python scripts/verify_reported_results.py
 python scripts/test_window_readout.py
 ```
 

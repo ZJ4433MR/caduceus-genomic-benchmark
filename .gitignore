@@ -31,9 +31,6 @@ lightning_logs/
 data/hg38/
 data/dnalongbench/
 data/genomic_benchmarks/
-results/figures/*.pdf
-results/figures/*.png
-!results/figures/README.md
 .staging_*/
 dist/
 package_build/

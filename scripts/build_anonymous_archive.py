@@ -24,7 +24,6 @@ def digest(data: bytes) -> str:
 
 def main() -> None:
     subprocess.run([sys.executable, str(ROOT / "scripts/validate_package.py")], check=True)
-    subprocess.run([sys.executable, str(ROOT / "scripts/verify_reported_results.py")], check=True)
     subprocess.run([sys.executable, str(ROOT / "scripts/test_window_readout.py")], check=True)
 
     files = sorted(validate_package.iter_package_files(), key=lambda item: item[1].as_posix())

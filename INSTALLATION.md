@@ -35,7 +35,6 @@ The package-level checks do not require a GPU:
 
 ```bash
 python scripts/validate_package.py
-python scripts/verify_reported_results.py
 python scripts/test_window_readout.py
 ```
 

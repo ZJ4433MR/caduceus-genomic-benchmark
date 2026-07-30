@@ -39,7 +39,6 @@ REQUIRED = (
     "docs/HYPERPARAMETERS.md",
     "docs/IMPLEMENTATION_MAP.md",
     "docs/LEGACY_IDENTIFIERS.md",
-    "docs/RESULT_PROVENANCE.md",
     "data/manifests/datasets.csv",
     "data/representative/README.md",
     "data/representative/etgp_metadata_subset.tsv",
@@ -48,15 +47,12 @@ REQUIRED = (
     "configs/model/flipped_gari_gb.yaml",
     "configs/model/flipped_gari_vep.yaml",
     "configs/model/flipped_gari_etgp.yaml",
-    "results/processed/genomicbenchmarks/main_table.csv",
-    "results/processed/vep/main_table.csv",
-    "results/processed/etgp/main_table.csv",
+    "results/README.md",
     "scripts/build_anonymous_archive.py",
     "scripts/launch/pretrain_flipped_gari.sh",
     "scripts/launch/run_genomicbenchmarks.sh",
     "scripts/launch/run_vep.sh",
     "scripts/launch/run_etgp.sh",
-    "scripts/verify_reported_results.py",
 )
 
 

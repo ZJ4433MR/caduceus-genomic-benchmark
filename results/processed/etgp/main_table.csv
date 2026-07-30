@@ -1,8 +1,0 @@
-model,pretraining_context_kb,test_auroc,test_auprc,source
-CNN,none,0.797,0.310,published_DNALongBench
-HyenaDNA,450,0.828,0.249,published_DNALongBench
-Caduceus-PH,131,0.826,0.380,published_DNALongBench
-Caduceus-PS,131,0.821,0.376,published_DNALongBench
-Flipped-GARI,1,0.822,0.434,this_work
-Flipped-GARI,2,0.823,0.445,this_work
-Flipped-GARI,5,0.829,0.446,this_work

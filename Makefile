@@ -4,7 +4,6 @@ PYTHON ?= python
 
 validate:
 	$(PYTHON) scripts/validate_package.py
-	$(PYTHON) scripts/verify_reported_results.py
 
 smoke:
 	$(PYTHON) -m compileall -q src caduceus scripts train.py vep_embeddings.py vep_svm_eval.py

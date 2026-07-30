@@ -9,11 +9,11 @@ This file maps the affirmative checklist answers to concrete artifact paths.
 | Complete source code | `src/`, `caduceus/`, `train.py`, VEP and evaluation scripts |
 | Public source under research license | `LICENSE`, `THIRD_PARTY_NOTICES.md` |
 | Comments mapping implementation to paper | `docs/IMPLEMENTATION_MAP.md` plus symbol-level comments |
-| Random seeds | GB 1--5; VEP 1--10; ETGP 2222/3333 in configs, launchers, and result CSVs |
+| Random seeds | GB 1--5; VEP 1--10; ETGP 2222/3333 in configs, launchers, and `docs/HYPERPARAMETERS.md` |
 | Hardware/software requirements | `INSTALLATION.md`, `caduceus_env.yml`, `docs/HARDWARE.md` |
 | Evaluation code | GB evaluation scripts, `vep_svm_eval.py`, ETGP global-metric evaluator |
-| Number of runs | `docs/HYPERPARAMETERS.md` and machine-readable `results/` |
-| Variation estimates | GB and VEP sample SD files and the reported ETGP comparison table |
+| Number of runs | `docs/HYPERPARAMETERS.md` and the experiment launchers |
+| Variation estimates | Evaluation scripts compute per-seed or per-subset metrics used by the paper |
 | Statistical tests | None claimed where sample size/protocol does not justify a test |
 | Final hyperparameters | `docs/HYPERPARAMETERS.md` and exact Hydra configuration files |
 | Data access and licensing | `docs/DATA_AND_LICENSES.md`, `data/manifests/datasets.csv` |
