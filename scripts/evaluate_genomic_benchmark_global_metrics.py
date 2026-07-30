@@ -36,7 +36,13 @@ def _move_to_device(obj, device):
 
 def _batch_logits(model, batch, batch_idx):
     model._process_state(batch, batch_idx, training=False)
-    logits, y, _ = model.forward(batch)
+    outputs = model.forward(batch)
+    # JanusDNA adds a fourth return value (MoE auxiliary loss) to the
+    # Caduceus task interface.  Both variants share logits and targets.
+    if len(outputs) == 4:
+        logits, y, _, _ = outputs
+    else:
+        logits, y, _ = outputs
     return logits.view(-1, logits.shape[-1]), y.view(-1)
 
 
@@ -73,7 +79,13 @@ def main(config: OmegaConf):
     batch_f1_binary = []
     batch_accuracy = []
 
-    with torch.no_grad():
+    # Training can use Lightning AMP, whereas this standalone evaluator calls
+    # the model directly.  Keep the default full-precision behavior but allow
+    # FlashAttention-based checkpoints (e.g. JanusDNA) to request bf16 AMP.
+    use_bf16_autocast = bool(config.eval.get("autocast_bf16", False)) and device.type == "cuda"
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16_autocast)
+
+    with torch.no_grad(), autocast:
         for batch_idx, batch in enumerate(dataloader):
             batch = _move_to_device(batch, device)
             logits, y = _batch_logits(model, batch, batch_idx)

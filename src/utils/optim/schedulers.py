@@ -85,3 +85,49 @@ class TimmCosineLRScheduler(CosineLRScheduler, torch.optim.lr_scheduler._LRSched
             super().step(epoch=self._last_epoch)
         else:
             super().step_update(num_updates=self._last_epoch)
+
+
+class ProportionalTimmCosineLRScheduler(TimmCosineLRScheduler):
+    """Cosine warmup/decay that preserves ratios between optimizer LR groups."""
+
+    def __init__(
+        self,
+        optimizer,
+        *args,
+        lr_min_rate=0.1,
+        warmup_lr_init_rate=0.0,
+        **kwargs,
+    ):
+        self.lr_min_rate = float(lr_min_rate)
+        self.warmup_lr_init_rate = float(warmup_lr_init_rate)
+        if not 0.0 <= self.lr_min_rate <= 1.0:
+            raise ValueError(f"lr_min_rate must be in [0, 1], got {self.lr_min_rate}.")
+        if not 0.0 <= self.warmup_lr_init_rate <= 1.0:
+            raise ValueError(
+                "warmup_lr_init_rate must be in [0, 1], "
+                f"got {self.warmup_lr_init_rate}."
+            )
+        if "lr_min" in kwargs or "warmup_lr_init" in kwargs:
+            raise ValueError(
+                "Use lr_min_rate and warmup_lr_init_rate with the proportional scheduler."
+            )
+        super().__init__(
+            optimizer,
+            *args,
+            lr_min=0.0,
+            warmup_lr_init=0.0,
+            **kwargs,
+        )
+
+    def _get_lr(self, t):
+        if t < self.warmup_t:
+            progress = float(t) / float(self.warmup_t)
+            scale = self.warmup_lr_init_rate + progress * (
+                1.0 - self.warmup_lr_init_rate
+            )
+        elif t < self.t_initial:
+            cosine = 0.5 * (1.0 + math.cos(math.pi * float(t) / float(self.t_initial)))
+            scale = self.lr_min_rate + (1.0 - self.lr_min_rate) * cosine
+        else:
+            scale = self.lr_min_rate
+        return [base_lr * scale for base_lr in self.base_values]

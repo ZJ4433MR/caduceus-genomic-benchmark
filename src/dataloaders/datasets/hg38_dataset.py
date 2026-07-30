@@ -46,8 +46,8 @@ class FastaInterval:
         if max_length == MAX_ALLOWED_LENGTH:
             return start, end
         if max_length < MAX_ALLOWED_LENGTH:
-            assert MAX_ALLOWED_LENGTH % max_length == 0
-            return start + i_shift * max_length, start + (i_shift + 1) * max_length
+            offset = min(i_shift * max_length, MAX_ALLOWED_LENGTH - max_length)
+            return start + offset, start + offset + max_length
         else:
             raise ValueError(f"`max_length` {max_length} (> 2^{int(math.log(MAX_ALLOWED_LENGTH, 2))}) is too large!")
 
@@ -151,8 +151,7 @@ class HG38Dataset(torch.utils.data.Dataset):
         self.add_eos = add_eos
 
         if max_length <= MAX_ALLOWED_LENGTH:
-            assert MAX_ALLOWED_LENGTH % max_length == 0, f"`max_length` must be a power of 2!"
-            self.shifts = MAX_ALLOWED_LENGTH // max_length
+            self.shifts = math.ceil(MAX_ALLOWED_LENGTH / max_length)
         else:
             raise ValueError(f"`max_length` {max_length} (> 2^{int(math.log(MAX_ALLOWED_LENGTH, 2))}) is too large!")
 

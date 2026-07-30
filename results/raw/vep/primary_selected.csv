@@ -1,0 +1,4 @@
+﻿"model_name","Distance to TSS","use_tissue","C","AUROC","AUROC_std","macro_AUROC_mean_over_buckets"
+"Flipped-GARI_d192l12_parammatch_131k_tuned_formal_tissue_ss5000_s10","0 - 30k","True","0.3","0.6563921096972368","0.005084596483721282","0.6418509196443153"
+"Flipped-GARI_d192l12_parammatch_131k_tuned_formal_tissue_ss5000_s10","100k+","True","0.1","0.64058884213449","0.003236135560192043","0.6418509196443153"
+"Flipped-GARI_d192l12_parammatch_131k_tuned_formal_tissue_ss5000_s10","30 - 100k","True","3.0","0.628571807101219","0.034211654885451255","0.6418509196443153"

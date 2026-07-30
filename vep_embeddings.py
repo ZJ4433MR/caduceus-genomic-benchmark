@@ -3,15 +3,18 @@
 """
 
 import argparse
+import json
 import os
 import shutil
 import socket
+import sys
+import tempfile
 import time
 import urllib.request
 from urllib.error import URLError
 from functools import partial
 from os import path as osp
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Iterator, Optional
 
 import fsspec
 import numpy as np
@@ -21,18 +24,89 @@ import torch.nn as nn
 import yaml
 from datasets import load_dataset, load_from_disk
 from sklearn import preprocessing
+from sklearn.model_selection import StratifiedShuffleSplit
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer, DefaultDataCollator
 
-from caduceus.tokenization_caduceus import CaduceusTokenizer
-from src.dataloaders.utils.rc import string_reverse_complement
-from src.models.sequence.dna_embedding import DNAEmbeddingModelMLBN
 from src.utils.train import get_logger
 
-WINDOW_SIZE_BP = 1536
+try:
+    from caduceus.tokenization_caduceus import CaduceusTokenizer
+except ImportError:
+    # Some runtime-only JanusDNA environments do not have the optional Mamba
+    # kernels needed by caduceus.__init__.  Load the tokenizer module directly.
+    import importlib.util
+
+    tokenizer_path = osp.join(osp.dirname(__file__), "caduceus", "tokenization_caduceus.py")
+    tokenizer_spec = importlib.util.spec_from_file_location("caduceus_tokenization_direct", tokenizer_path)
+    tokenizer_module = importlib.util.module_from_spec(tokenizer_spec)
+    assert tokenizer_spec.loader is not None
+    tokenizer_spec.loader.exec_module(tokenizer_module)
+    CaduceusTokenizer = tokenizer_module.CaduceusTokenizer
+
+VEP_TSS_BUCKETS = (
+    (0, 30_000, "0 - 30k"),
+    (30_001, 100_000, "30 - 100k"),
+    (100_001, None, "100k+"),
+)
+PREPARED_VEP_METADATA_FILENAME = "prepared_vep_metadata.json"
+PREPARED_VEP_MANIFEST_FILENAME = "train_subset_manifest.json"
+PREPARED_VEP_SCHEMA_VERSION = 1
 log = get_logger(__name__)
+
+_DNA_COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def string_reverse_complement(sequence: str) -> str:
+    return sequence.translate(_DNA_COMPLEMENT)[::-1]
+
+
+class DistributedSequentialSampler(Sampler[int]):
+    """Shard evaluation data across ranks without dropping or padding samples."""
+
+    def __init__(self, dataset: Dataset, num_replicas: Optional[int] = None, rank: Optional[int] = None):
+        self.dataset = dataset
+        self.num_replicas = num_replicas if num_replicas is not None else (
+            dist.get_world_size() if dist.is_initialized() else 1
+        )
+        self.rank = rank if rank is not None else (dist.get_rank() if dist.is_initialized() else 0)
+        if self.num_replicas < 1:
+            raise ValueError(f"num_replicas must be positive, got {self.num_replicas}")
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"rank must be in [0, {self.num_replicas}), got {self.rank}")
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
+
+
+class IndexedDataset(Dataset):
+    """Attach a stable split-local index so orientation dumps can be aligned safely."""
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict:
+        example = dict(self.dataset[index])
+        example["sample_index"] = index
+        return example
+
+
+def pooled_window_bounds(window_size_tokens: int) -> tuple[int, int]:
+    """Return an exclusive range containing exactly ``window_size_tokens`` offsets."""
+    if window_size_tokens < 1:
+        raise ValueError(f"window_size_tokens must be positive, got {window_size_tokens}")
+    left = window_size_tokens // 2
+    right = window_size_tokens - left - 1
+    return -left, right + 1
 
 try:
     import enformer_pytorch
@@ -41,8 +115,19 @@ except ImportError:
 
 
 def is_mlbn_local(model_name_or_path: Optional[str]) -> bool:
-    """Return true when using the local MLBN checkpoint loader."""
-    return (model_name_or_path or "").lower() in {"mlbn-local", "mlbn_local", "local-mlbn"}
+    """Return true when using the local Flipped-GARI checkpoint loader."""
+    return (model_name_or_path or "").lower() in {
+        "flipped-gari-local",
+        "flipped_gari_local",
+        "mlbn-local",
+        "mlbn_local",
+        "local-mlbn",
+    }
+
+
+def is_janusdna_local(model_name_or_path: Optional[str]) -> bool:
+    """Return true when using a local JanusDNA checkpoint loader."""
+    return (model_name_or_path or "").lower() in {"janusdna-local", "janusdna_local", "local-janusdna"}
 
 
 def install_retrying_urlretrieve(max_attempts: int, timeout: int):
@@ -175,17 +260,19 @@ class DNAEmbeddingModel(nn.Module):
 
 
 class MLBNLocalEmbeddingModel(nn.Module):
-    """Local MLBN backbone loader for non-HuggingFace checkpoints."""
+    """Local Flipped-GARI loader retaining legacy checkpoint key names."""
 
     def __init__(self, config_path: str, checkpoint_path: str):
         super().__init__()
         if not config_path:
-            raise ValueError("--mlbn_config is required for model_name_or_path=mlbn-local")
+            raise ValueError("--flipped_gari_config is required for the local Flipped-GARI loader")
         if not checkpoint_path:
-            raise ValueError("--mlbn_checkpoint is required for model_name_or_path=mlbn-local")
+            raise ValueError("--flipped_gari_checkpoint is required for the local Flipped-GARI loader")
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         config.pop("_name_", None)
+        from src.models.sequence.dna_embedding import DNAEmbeddingModelMLBN
+
         self.backbone = DNAEmbeddingModelMLBN(**config)
         self._load_checkpoint(checkpoint_path)
 
@@ -200,7 +287,7 @@ class MLBNLocalEmbeddingModel(nn.Module):
             for prefix in ("model.", "backbone."):
                 if clean_key.startswith(prefix):
                     clean_key = clean_key[len(prefix):]
-            if clean_key.startswith("lm_head."):
+            if clean_key.startswith("lm_head.") or "torchmetrics" in clean_key:
                 continue
             if clean_key in model_state and model_state[clean_key].shape == value.shape:
                 remapped[clean_key] = value
@@ -208,20 +295,107 @@ class MLBNLocalEmbeddingModel(nn.Module):
                 dropped.append(key)
         missing, unexpected = self.backbone.load_state_dict(remapped, strict=False)
         print(
-            "MLBN_LOCAL_LOAD "
+            "FLIPPED_GARI_LOCAL_LOAD "
             f"checkpoint={checkpoint_path} loaded={len(remapped)} "
             f"missing={len(missing)} unexpected={len(unexpected)} dropped={len(dropped)}"
         )
         if missing:
-            print(f"MLBN_LOCAL_MISSING_KEYS={missing[:20]}")
+            print(f"FLIPPED_GARI_LOCAL_MISSING_KEYS={missing[:20]}")
         if unexpected:
-            print(f"MLBN_LOCAL_UNEXPECTED_KEYS={unexpected[:20]}")
+            print(f"FLIPPED_GARI_LOCAL_UNEXPECTED_KEYS={unexpected[:20]}")
+        if missing or unexpected or dropped:
+            raise RuntimeError(
+                "Flipped-GARI checkpoint audit failed: every embedding/encoder/norm key must load "
+                "with the expected shape. Only lm_head/torchmetrics keys may be discarded. "
+                f"missing={missing[:20]} unexpected={unexpected[:20]} dropped={dropped[:20]}"
+            )
 
     def forward(self, input_ids):
         output = self.backbone(input_ids)
         if isinstance(output, tuple):
             return output[0]
         return output
+
+
+class JanusDNALocalEmbeddingModel(nn.Module):
+    """Local JanusDNA backbone loader for non-HuggingFace checkpoints."""
+
+    def __init__(self, janusdna_root: str, config_path: str, checkpoint_path: str):
+        super().__init__()
+        if not janusdna_root:
+            raise ValueError("--janusdna_root is required for model_name_or_path=janusdna-local")
+        if not config_path:
+            raise ValueError("--janusdna_config is required for model_name_or_path=janusdna-local")
+        if not checkpoint_path:
+            raise ValueError("--janusdna_checkpoint is required for model_name_or_path=janusdna-local")
+        janusdna_root = osp.abspath(janusdna_root)
+        if janusdna_root not in sys.path:
+            sys.path.insert(0, janusdna_root)
+
+        from janusdna.configuration_janusdna import JanusDNAConfig
+        from janusdna.modeling_janusdna import JanusDNAModel
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_blob = json.load(f)
+        config = dict(config_blob.get("config", config_blob))
+        config.pop("_target_", None)
+        # Router-loss logits and training checkpointing are unnecessary for frozen embedding extraction.
+        config["output_router_logits"] = False
+        config["gradient_checkpointing"] = False
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            # The public JanusDNA checkpoint records FlashAttention2 as its HF
+            # attention implementation.  Keep the architecture unchanged when
+            # flash_attn is present; otherwise avoid an initialization-time
+            # import error in inference-only smoke tests.
+            config["_attn_implementation"] = "eager"
+        self.backbone = JanusDNAModel(JanusDNAConfig(**config))
+        self._load_checkpoint(checkpoint_path)
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        model_state = self.backbone.state_dict()
+        remapped = {}
+        dropped = []
+        for key, value in state_dict.items():
+            clean_key = key
+            for prefix in ("model.model.", "model.", "backbone."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+                    break
+            if clean_key.startswith("lm_head.") or "torchmetrics" in clean_key:
+                continue
+            if clean_key in model_state and model_state[clean_key].shape == value.shape:
+                remapped[clean_key] = value
+            else:
+                dropped.append(key)
+        missing, unexpected = self.backbone.load_state_dict(remapped, strict=False)
+        print(
+            "JANUSDNA_LOCAL_LOAD "
+            f"checkpoint={checkpoint_path} loaded={len(remapped)} "
+            f"missing={len(missing)} unexpected={len(unexpected)} dropped={len(dropped)}"
+        )
+        if missing:
+            print(f"JANUSDNA_LOCAL_MISSING_KEYS={missing[:20]}")
+        if unexpected:
+            print(f"JANUSDNA_LOCAL_UNEXPECTED_KEYS={unexpected[:20]}")
+        if dropped:
+            print(f"JANUSDNA_LOCAL_DROPPED_KEYS={dropped[:20]}")
+        if missing or unexpected or dropped:
+            raise RuntimeError(
+                "JanusDNA checkpoint audit failed: every backbone key must load "
+                "with the expected shape. "
+                f"missing={missing[:20]} unexpected={unexpected[:20]} dropped={dropped[:20]}"
+            )
+
+    def forward(self, input_ids):
+        output = self.backbone(input_ids, return_dict=False)
+        hidden_states = output[0] if isinstance(output, tuple) else output
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = torch.stack(hidden_states, dim=0).sum(dim=0)
+        return hidden_states
 
 
 class EnformerTokenizer:
@@ -324,12 +498,28 @@ def tokenize_variants(examples, tokenizer, max_length: int):
         max_length=max_length,
         truncation=True,
     )
+    ref_flip_tokenized = tokenizer.batch_encode_plus(
+        [seq[::-1] for seq in examples["ref_forward_sequence"]],
+        add_special_tokens=False,
+        return_attention_mask=False,
+        max_length=max_length,
+        truncation=True,
+    )
+    alt_flip_tokenized = tokenizer.batch_encode_plus(
+        [seq[::-1] for seq in examples["alt_forward_sequence"]],
+        add_special_tokens=False,
+        return_attention_mask=False,
+        max_length=max_length,
+        truncation=True,
+    )
 
     return {
         "ref_input_ids": ref_tokenized["input_ids"],
         "alt_input_ids": alt_tokenized["input_ids"],
         "ref_rc_input_ids": ref_rc_tokenized["input_ids"],
         "alt_rc_input_ids": alt_rc_tokenized["input_ids"],
+        "ref_flip_input_ids": ref_flip_tokenized["input_ids"],
+        "alt_flip_input_ids": alt_flip_tokenized["input_ids"],
     }
 
 
@@ -376,6 +566,70 @@ def find_variant_idx(examples):
     return {"variant_idx": idx, "rc_variant_idx": rc_idx}
 
 
+def select_fixed_vep_train_subset(dataset, args):
+    """Apply one paired, label-stratified train subset before tokenization/embedding."""
+    if args.train_samples_per_tss_bucket is not None:
+        train = dataset["train"]
+        source_indices = np.arange(len(train), dtype=np.int64)
+        distances = np.asarray(train["distance_to_nearest_tss"])
+        label_column = "labels" if "labels" in train.column_names else "label"
+        labels = np.asarray(train[label_column])
+        selected = []
+        bucket_manifest = []
+        for bucket_id, (min_distance, max_distance, bucket_name) in enumerate(VEP_TSS_BUCKETS):
+            mask = distances >= min_distance
+            if max_distance is not None:
+                mask &= distances <= max_distance
+            candidates = np.flatnonzero(mask)
+            sample_size = min(args.train_samples_per_tss_bucket, len(candidates))
+            if sample_size < len(candidates):
+                splitter = StratifiedShuffleSplit(
+                    n_splits=1,
+                    train_size=sample_size,
+                    random_state=args.train_subset_seed + bucket_id,
+                )
+                try:
+                    local_indices, _ = next(splitter.split(np.zeros(len(candidates)), labels[candidates]))
+                    chosen = candidates[local_indices]
+                except ValueError:
+                    rng = np.random.default_rng(args.train_subset_seed + bucket_id)
+                    chosen = rng.choice(candidates, size=sample_size, replace=False)
+            else:
+                chosen = candidates
+            selected.extend(chosen.tolist())
+            unique_labels, label_counts = np.unique(labels[chosen], return_counts=True)
+            bucket_manifest.append({
+                "bucket_id": bucket_id,
+                "bucket": bucket_name,
+                "available": int(len(candidates)),
+                "selected": int(len(chosen)),
+                "label_counts": {
+                    str(label): int(count) for label, count in zip(unique_labels.tolist(), label_counts.tolist())
+                },
+            })
+        selected = np.asarray(sorted(selected), dtype=np.int64)
+        dataset["train"] = train.select(selected.tolist())
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            manifest_dir = osp.join(args.downstream_save_dir, args.name)
+            os.makedirs(manifest_dir, exist_ok=True)
+            manifest_path = osp.join(manifest_dir, "train_subset_manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "seed": args.train_subset_seed,
+                    "samples_per_tss_bucket": args.train_samples_per_tss_bucket,
+                    "label_column": label_column,
+                    "source_index_definition": "post-N-filter, pre-subset train split index",
+                    "selected_source_indices": source_indices[selected].tolist(),
+                    "buckets": bucket_manifest,
+                }, handle, indent=2)
+            log.warning(f"Wrote fixed VEP train subset manifest: {manifest_path}")
+        log.warning(
+            f"Selected fixed VEP train subset: {len(selected)} examples "
+            f"({args.train_samples_per_tss_bucket} per TSS bucket where available)."
+        )
+    return dataset
+
+
 def load_vep_dataset(args, datasets_cache_root):
     """Load and lightly normalize the VEP dataset without tokenizing it."""
     install_retrying_urlretrieve(args.download_retries, args.download_timeout)
@@ -402,7 +656,134 @@ def load_vep_dataset(args, datasets_cache_root):
         remove_columns=["chromosome", "tissue", "distance_to_nearest_tss"],
         desc="Recast chromosome"
     )
+    return select_fixed_vep_train_subset(dataset, args)
+
+
+def expected_prepared_vep_metadata(args):
+    """Return the immutable settings that identify a reusable raw VEP dataset."""
+    return {
+        "schema_version": PREPARED_VEP_SCHEMA_VERSION,
+        "vep_task_name": args.vep_task_name,
+        "seq_len": args.seq_len,
+        "train_samples_per_tss_bucket": args.train_samples_per_tss_bucket,
+        "train_subset_seed": args.train_subset_seed,
+    }
+
+
+def _validate_prepared_vep_metadata(args, prepared_path):
+    metadata_path = osp.join(prepared_path, PREPARED_VEP_METADATA_FILENAME)
+    if not osp.isfile(metadata_path):
+        raise FileNotFoundError(
+            f"Prepared VEP metadata is missing: {metadata_path}. "
+            "Rebuild the cache with --prepare_dataset_only."
+        )
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    expected = expected_prepared_vep_metadata(args)
+    mismatches = {
+        key: {"expected": value, "found": metadata.get(key)}
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"Prepared VEP dataset settings do not match {prepared_path}: {mismatches}"
+        )
+    return metadata
+
+
+def load_prepared_vep_dataset(args):
+    """Load a shared raw-sequence VEP dataset and audit its immutable settings."""
+    prepared_path = osp.abspath(args.prepared_dataset_path)
+    if not osp.isdir(prepared_path):
+        raise FileNotFoundError(
+            f"Prepared VEP dataset does not exist: {prepared_path}. "
+            "Run once with --prepare_dataset_only before distributed embedding extraction."
+        )
+    metadata = _validate_prepared_vep_metadata(args, prepared_path)
+    dataset = load_from_disk(prepared_path)
+    split_sizes = {split_name: len(split) for split_name, split in dataset.items()}
+    if split_sizes != metadata.get("split_sizes"):
+        raise RuntimeError(
+            f"Prepared VEP split sizes do not match metadata: "
+            f"loaded={split_sizes}, metadata={metadata.get('split_sizes')}"
+        )
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        source_manifest = osp.join(prepared_path, PREPARED_VEP_MANIFEST_FILENAME)
+        if args.train_samples_per_tss_bucket is not None and not osp.isfile(source_manifest):
+            raise FileNotFoundError(f"Prepared VEP subset manifest is missing: {source_manifest}")
+        if osp.isfile(source_manifest):
+            output_dir = osp.join(args.downstream_save_dir, args.name)
+            os.makedirs(output_dir, exist_ok=True)
+            shutil.copyfile(
+                source_manifest,
+                osp.join(output_dir, PREPARED_VEP_MANIFEST_FILENAME),
+            )
+    log.warning(f"Loaded audited shared VEP dataset from {prepared_path}: {split_sizes}")
     return dataset
+
+
+def prepare_shared_vep_dataset(args):
+    """Build one atomically published raw-sequence dataset for all model cells."""
+    if not args.prepared_dataset_path:
+        raise ValueError("--prepared_dataset_path is required with --prepare_dataset_only.")
+    prepared_path = osp.abspath(args.prepared_dataset_path)
+    if osp.isdir(prepared_path):
+        metadata = _validate_prepared_vep_metadata(args, prepared_path)
+        dataset = load_from_disk(prepared_path)
+        split_sizes = {split_name: len(split) for split_name, split in dataset.items()}
+        if split_sizes != metadata.get("split_sizes"):
+            raise RuntimeError(
+                f"Existing prepared VEP cache is incomplete: loaded={split_sizes}, "
+                f"metadata={metadata.get('split_sizes')}"
+            )
+        log.warning(f"Prepared VEP dataset already exists and passed audit: {prepared_path}")
+        return
+    if osp.exists(prepared_path):
+        raise RuntimeError(f"Prepared VEP target exists but is not a directory: {prepared_path}")
+
+    datasets_cache_root = os.getenv("HF_DATASETS_CACHE")
+    if datasets_cache_root is None:
+        hf_home = os.getenv("HF_HOME", osp.expanduser("~/.cache/huggingface"))
+        datasets_cache_root = osp.join(hf_home, "datasets")
+    parent = osp.dirname(prepared_path)
+    os.makedirs(parent, exist_ok=True)
+    prefix = f".{osp.basename(prepared_path)}.preparing-"
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as staging_root:
+        prep_args = argparse.Namespace(**vars(args))
+        prep_args.downstream_save_dir = staging_root
+        prep_args.name = "manifest"
+        dataset = load_vep_dataset(prep_args, datasets_cache_root)
+        staged_dataset = osp.join(staging_root, "dataset")
+        dataset.save_to_disk(staged_dataset)
+
+        source_manifest = osp.join(
+            staging_root, "manifest", PREPARED_VEP_MANIFEST_FILENAME
+        )
+        if args.train_samples_per_tss_bucket is not None:
+            if not osp.isfile(source_manifest):
+                raise RuntimeError(f"VEP preparation did not write its subset manifest: {source_manifest}")
+            shutil.copyfile(
+                source_manifest,
+                osp.join(staged_dataset, PREPARED_VEP_MANIFEST_FILENAME),
+            )
+
+        metadata = expected_prepared_vep_metadata(args)
+        metadata["split_sizes"] = {
+            split_name: len(split) for split_name, split in dataset.items()
+        }
+        with open(
+            osp.join(staged_dataset, PREPARED_VEP_METADATA_FILENAME),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True)
+
+        # The target is published only after every split and audit file is complete.
+        os.rename(staged_dataset, prepared_path)
+    _validate_prepared_vep_metadata(args, prepared_path)
+    log.warning(f"Published shared VEP dataset atomically: {prepared_path}")
 
 
 def prepare_dataset(args, tokenizer):
@@ -432,6 +813,8 @@ def prepare_dataset(args, tokenizer):
 
     if args.stream_tokenize:
         log.warning("Using streaming tokenization; full tokenized VEP dataset will not be saved to disk.")
+        if args.prepared_dataset_path:
+            return load_prepared_vep_dataset(args)
         return load_vep_dataset(args, datasets_cache_root)
 
     if not fsspec_exists(preprocessed_cache_file):
@@ -460,6 +843,12 @@ def get_backbone_model(args, device):
         model = MLBNLocalEmbeddingModel(
             config_path=args.mlbn_config,
             checkpoint_path=args.mlbn_checkpoint,
+        )
+    elif is_janusdna_local(args.model_name_or_path):
+        model = JanusDNALocalEmbeddingModel(
+            janusdna_root=args.janusdna_root,
+            config_path=args.janusdna_config,
+            checkpoint_path=args.janusdna_checkpoint,
         )
     else:
         model = DNAEmbeddingModel(
@@ -506,6 +895,7 @@ def streaming_tokenize_collate(batch, tokenizer, max_length: int, use_sequence_v
         example["labels"] if "labels" in example else example["label"]
         for example in batch
     ])
+    output["sample_index"] = torch.tensor([example["sample_index"] for example in batch], dtype=torch.long)
     for key in ["chromosome", "distance_to_nearest_tss", "tissue_embed"]:
         output[key] = torch.tensor([example[key] for example in batch])
     return output
@@ -527,17 +917,25 @@ def dump_embeddings(args, dataset, model, tokenizer, device):
 
         # Compute windowed statistics
         if "enformer" in args.model_name_or_path.lower():
-            window_size = WINDOW_SIZE_BP // 128  # Enformer's receptive field is 128
+            window_size = args.window_size_bp // 128  # Enformer's receptive field is 128
             # We also need to override variant_idx since Enformer model reduces to target_length of 896
             variant_idx = torch.ones_like(variant_idx) * item_ref.size(1) // 2
         else:
-            window_size = WINDOW_SIZE_BP // args.bp_per_token
+            if args.window_size_bp % args.bp_per_token:
+                raise ValueError(
+                    f"window_size_bp={args.window_size_bp} must be divisible by "
+                    f"bp_per_token={args.bp_per_token}"
+                )
+            window_size = args.window_size_bp // args.bp_per_token
 
-        # Add 1 so that window is: [window // 2 - SNP - window // 2]
-        start, end = -window_size // 2, window_size // 2 + 1
+        start, end = pooled_window_bounds(window_size)
         expanded_indices = torch.arange(start, end, device=item_ref.device).unsqueeze(0) + \
                            variant_idx.unsqueeze(1).to(item_ref.device)
-        expanded_indices = torch.clamp(expanded_indices, 0, item_ref.size(1) - 1)  # Handle boundary conditions
+        if expanded_indices.min().item() < 0 or expanded_indices.max().item() >= item_ref.size(1):
+            raise ValueError(
+                "The requested variant-centered readout exceeds the available sequence. "
+                "Set --window_size_bp no larger than the downstream input length."
+            )
         tokens_window_ref = torch.gather(
             item_ref, 1,
             expanded_indices.unsqueeze(-1).expand(-1, -1, item_ref.size(2))
@@ -551,6 +949,8 @@ def dump_embeddings(args, dataset, model, tokenizer, device):
 
     embeds_path = osp.join(args.downstream_save_dir, args.name)
     os.makedirs(embeds_path, exist_ok=True)
+    paired_key = f"{args.eval_orientation}_concat_avg_ws"
+    include_paired = not args.skip_paired
 
     num_tokens = args.seq_len // args.bp_per_token
     collate_fn = DefaultDataCollator(return_tensors="pt")
@@ -568,7 +968,7 @@ def dump_embeddings(args, dataset, model, tokenizer, device):
         "num_workers": args.num_workers,
         "pin_memory": False,
         "shuffle": False,
-        "drop_last": True
+        "drop_last": False,
     }
 
     # Process label_encoder = preprocessing.LabelEncoder()
@@ -579,108 +979,233 @@ def dump_embeddings(args, dataset, model, tokenizer, device):
     test_tissue_embed = label_encoder.transform(dataset["test"]["tissue"])
     dataset["test"] = dataset["test"].add_column("tissue_embed", test_tissue_embed)
 
-    if not all([
-        fsspec_exists(osp.join(embeds_path, f"{split_name}_embeds_combined.pt")) for split_name in dataset.keys()
-    ]):
-        for split_name, split in dataset.items():
-            sampler = DistributedSampler(
-                split,
-                shuffle=dataloader_params.get("shuffle", False),
-                drop_last=dataloader_params.get("drop_last", True),
+    selected_splits = set(args.splits)
+    for split_name, split in dataset.items():
+        if split_name not in selected_splits:
+            continue
+        combined_path = osp.join(embeds_path, f"{split_name}_embeds_combined.pt")
+        existing_combined = None
+        if include_paired and fsspec_exists(combined_path):
+            with fsspec.open(combined_path, "rb") as f:
+                existing_combined = torch.load(f, map_location="cpu")
+            if paired_key in existing_combined:
+                log.warning(f"{split_name} already contains {paired_key}, skipping.")
+                continue
+            if "sample_index" not in existing_combined:
+                raise RuntimeError(
+                    f"Cannot append {paired_key} to legacy cache {combined_path}: "
+                    "sample_index is missing. Re-dump this split with the audited cache format."
+                )
+            log.warning(f"{split_name} is missing {paired_key}; dumping it for an incremental merge.")
+
+        indexed_split = IndexedDataset(split)
+        manual_num_shards = args.manual_num_shards
+        manual_shard_index = args.manual_shard_index
+        sampler = DistributedSequentialSampler(
+            indexed_split,
+            num_replicas=manual_num_shards,
+            rank=manual_shard_index,
+        )
+        shard_rank = sampler.rank
+        include_canonical = existing_combined is None
+        if not include_canonical:
+            log.warning(f"Reusing canonical embeddings from {combined_path}.")
+
+        dl = DataLoader(indexed_split, **dataloader_params, sampler=sampler)
+
+        storage_dict = {
+            "sample_index": [],
+            "chromosome": [],
+            "labels": [],
+            "distance_to_nearest_tss": [],
+            "tissue_embed": [],
+        }
+        if include_paired:
+            storage_dict[paired_key] = []
+        if include_canonical:
+            storage_dict["concat_avg_ws"] = []
+
+        autocast_enabled = args.autocast_dtype != "fp32"
+        autocast_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }[args.autocast_dtype]
+        torch.cuda.reset_peak_memory_stats(device)
+        split_start = time.perf_counter()
+
+        with torch.no_grad():
+
+            for batch_idx, batch in tqdm(
+                    enumerate(dl), total=len(dl), desc=f"[RANK {dist.get_rank()}] Embedding {split_name}",
+                    disable=dist.get_rank() != 0  # Only rank 0 updates pbar
+            ):
+                for key in ["sample_index", "chromosome", "labels", "distance_to_nearest_tss", "tissue_embed"]:
+                    storage_dict[key].append(batch[key].to("cpu", non_blocking=True))
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=autocast_dtype,
+                    enabled=autocast_enabled,
+                ):
+                    output_alt = model(batch["alt_input_ids"].to(device))
+                    output_ref = model(batch["ref_input_ids"].to(device))
+                    if include_paired and args.rcps:
+                        num_channels = output_alt.size(-1)
+                        if args.eval_orientation == "rc":
+                            # Flip along length and channel dims to preserve RC equivariance.
+                            output_alt_paired = output_alt[..., num_channels // 2:].contiguous().flip(dims=[1, 2])
+                            output_ref_paired = output_ref[..., num_channels // 2:].contiguous().flip(dims=[1, 2])
+                        else:
+                            output_alt_paired = model(batch["alt_flip_input_ids"].to(device))
+                            output_ref_paired = model(batch["ref_flip_input_ids"].to(device))
+                            output_alt_paired = output_alt_paired[..., :num_channels // 2].contiguous().flip(dims=[1])
+                            output_ref_paired = output_ref_paired[..., :num_channels // 2].contiguous().flip(dims=[1])
+                        output_alt = output_alt[..., :num_channels // 2]
+                        output_ref = output_ref[..., :num_channels // 2]
+
+                    elif include_paired:
+                        paired_alt_key = (
+                            "alt_rc_input_ids" if args.eval_orientation == "rc"
+                            else "alt_flip_input_ids"
+                        )
+                        paired_ref_key = (
+                            "ref_rc_input_ids" if args.eval_orientation == "rc"
+                            else "ref_flip_input_ids"
+                        )
+                        # Flip along length dim so variant_idx aligns after RC or plain reversal.
+                        output_alt_paired = model(batch[paired_alt_key].to(device)).contiguous().flip(dims=[1])
+                        output_ref_paired = model(batch[paired_ref_key].to(device)).contiguous().flip(dims=[1])
+
+                metrics = extract_embeddings(
+                    item_ref=output_ref,
+                    item_alt=output_alt,
+                    variant_idx=batch["variant_idx"],
+                )
+                if include_canonical:
+                    for key, value in metrics.items():
+                        storage_dict[key].append(value.to("cpu", non_blocking=True))
+
+                if include_paired:
+                    metrics_paired = extract_embeddings(
+                        item_ref=output_ref_paired,
+                        item_alt=output_alt_paired,
+                        variant_idx=batch["variant_idx"],
+                    )
+                    for key, value in metrics_paired.items():
+                        storage_dict[f"{args.eval_orientation}_{key}"].append(
+                            metrics_paired[key].to("cpu", non_blocking=True)
+                        )
+
+                if batch_idx % 100 == 0:
+                    # Every machine should print progress updates
+                    print(
+                        f"[RANK {dist.get_rank()} SHARD {shard_rank}/{sampler.num_replicas}] "
+                        f"Completed index: {batch_idx}/{len(dl)}"
+                    )
+
+            storage_dict_temp = concat_storage_dict_values(storage_dict)
+            torch.cuda.synchronize(device)
+            elapsed_seconds = time.perf_counter() - split_start
+            samples_dumped = int(storage_dict_temp["sample_index"].numel())
+            if args.skip_paired:
+                encoded_sequences_per_example = 2
+            else:
+                encoded_sequences_per_example = 2 if args.rcps and args.eval_orientation == "rc" else 4
+            model_tokens = samples_dumped * encoded_sequences_per_example * num_tokens
+            performance = {
+                "split": split_name,
+                "orientation": args.eval_orientation,
+                "skip_paired": args.skip_paired,
+                "rank": dist.get_rank(),
+                "shard_rank": shard_rank,
+                "num_shards": sampler.num_replicas,
+                "samples_dumped": samples_dumped,
+                "encoded_sequences_per_example": encoded_sequences_per_example,
+                "sequence_length_bp": args.seq_len,
+                "effective_tokens_per_sequence": num_tokens,
+                "model_tokens_processed": model_tokens,
+                "elapsed_seconds": elapsed_seconds,
+                "model_tokens_per_second": model_tokens / elapsed_seconds if elapsed_seconds else 0.0,
+                "peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                "peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
+            }
+            rank_path = osp.join(embeds_path, f"{split_name}_embeds_{args.eval_orientation}_{shard_rank}.pt")
+            with fsspec.open(rank_path, "wb") as f:
+                torch.save(storage_dict_temp, f)
+            performance_path = osp.join(
+                embeds_path,
+                f"{split_name}_performance_{args.eval_orientation}_{shard_rank}.json",
+            )
+            with fsspec.open(performance_path, "w") as f:
+                json.dump(performance, f, indent=2, sort_keys=True)
+            print(f"[RANK {dist.get_rank()}] Saved {split_name} to {rank_path}")
+            log.warning("VEP_DUMP_PERFORMANCE %s", json.dumps(performance, sort_keys=True))
+
+def _sort_storage_by_sample_index(storage_dict: dict) -> dict:
+    sample_index = storage_dict.get("sample_index")
+    if sample_index is None:
+        raise RuntimeError("Embedding cache is missing sample_index; cannot verify orientation alignment.")
+    if sample_index.ndim != 1 or torch.unique(sample_index).numel() != sample_index.numel():
+        raise RuntimeError("Embedding cache has duplicated sample_index values.")
+    order = torch.argsort(sample_index)
+    return {key: value[order] for key, value in storage_dict.items()}
+
+
+def combine_embeddings(embeds_path, orientation, splits=("train", "test"), expected_sizes=None):
+    """Merge one orientation's rank shards into the audited combined cache."""
+    for split in splits:
+        rank_prefix = f"{split}_embeds_{orientation}_"
+        rank_files = [
+            filename for filename in fsspec_listdir(embeds_path)
+            if osp.basename(filename).startswith(rank_prefix) and filename.endswith(".pt")
+        ]
+        if not rank_files:
+            log.warning(f"No {orientation} rank files found for {split} in {embeds_path}; skipping combine.")
+            continue
+
+        shards = []
+        for filename in rank_files:
+            log.warning(f"Loading data from: {filename}")
+            with fsspec.open(filename, "rb") as f:
+                shards.append(torch.load(f, map_location="cpu"))
+        new_data = _sort_storage_by_sample_index(concat_storage_dict_values({
+            key: [shard[key] for shard in shards]
+            for key in shards[0].keys()
+        }))
+
+        expected_size = expected_sizes.get(split) if expected_sizes else None
+        if expected_size is not None and new_data["sample_index"].numel() != expected_size:
+            raise RuntimeError(
+                f"{split} emitted {new_data['sample_index'].numel()} samples, expected {expected_size}."
             )
 
-            dl = DataLoader(split, **dataloader_params, sampler=sampler)
+        combined_path = osp.join(embeds_path, f"{split}_embeds_combined.pt")
+        paired_key = f"{orientation}_concat_avg_ws"
+        if fsspec_exists(combined_path):
+            with fsspec.open(combined_path, "rb") as f:
+                combined = _sort_storage_by_sample_index(torch.load(f, map_location="cpu"))
+            if not torch.equal(combined["sample_index"], new_data["sample_index"]):
+                raise RuntimeError(f"{split} {orientation} cache sample indices do not match the canonical cache.")
+            combined[paired_key] = new_data[paired_key]
+            storage_dict = combined
+        else:
+            storage_dict = new_data
 
-            storage_dict = {
-                "concat_avg_ws": [],
-                "rc_concat_avg_ws": [],
-                "chromosome": [],
-                "labels": [],
-                "distance_to_nearest_tss": [],
-                "tissue_embed": [],
-            }
-
-            with torch.no_grad():
-
-                for batch_idx, batch in tqdm(
-                        enumerate(dl), total=len(dl), desc=f"[RANK {dist.get_rank()}] Embedding {split_name}",
-                        disable=dist.get_rank() != 0  # Only rank 0 updates pbar
-                ):
-                    for key in ["chromosome", "labels", "distance_to_nearest_tss", "tissue_embed"]:
-                        storage_dict[key].append(batch[key].to("cpu", non_blocking=True))
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        output_alt = model(batch["alt_input_ids"].to(device))
-                        output_ref = model(batch["ref_input_ids"].to(device))
-                        if args.rcps:
-                            num_channels = output_alt.size(-1)
-                            # Flip along length and channel dims to preserve RC equivariance
-                            # i.e. output_rc(RC(inputs)) = outputs(inputs)
-                            output_alt_rc = output_alt[..., num_channels // 2:].contiguous().flip(dims=[1, 2])
-                            output_ref_rc = output_ref[..., num_channels // 2:].contiguous().flip(dims=[1, 2])
-                            output_alt = output_alt[..., :num_channels // 2]
-                            output_ref = output_ref[..., :num_channels // 2]
-
-                        else:
-                            # Flip along length dim so variant_idx aligns
-                            output_alt_rc = model(batch["alt_rc_input_ids"].to(device)).contiguous().flip(dims=[1])
-                            output_ref_rc = model(batch["ref_rc_input_ids"].to(device)).contiguous().flip(dims=[1])
-
-                    metrics = extract_embeddings(
-                        item_ref=output_ref,
-                        item_alt=output_alt,
-                        variant_idx=batch["variant_idx"],
-                    )
-                    for key, value in metrics.items():
-                        storage_dict[key].append(metrics[key].to("cpu", non_blocking=True))
-
-                    metrics_rc = extract_embeddings(
-                        item_ref=output_ref_rc,
-                        item_alt=output_alt_rc,
-                        variant_idx=batch["variant_idx"],
-                    )
-                    for key, value in metrics_rc.items():
-                        storage_dict[f"rc_{key}"].append(metrics_rc[key].to("cpu", non_blocking=True))
-
-                    if batch_idx % 100 == 0:
-                        # Every machine should print progress updates
-                        print(f"[RANK {dist.get_rank()}] Completed index: {batch_idx}/{len(dl)}")
-
-                storage_dict_temp = concat_storage_dict_values(storage_dict)
-                with fsspec.open(osp.join(embeds_path, f"{split_name}_embeds_{dist.get_rank()}.pt"), "wb") as f:
-                    torch.save(storage_dict_temp, f)
-                print(f"[RANK {dist.get_rank()}] Saved {split_name} to {osp.join(embeds_path, f'{split_name}_embeds_{dist.get_rank()}.pt')}")
-    else:
-        log.warning("Embeddings already exist, skipping!")
-
-
-def combine_embeddings(embeds_path):
-    """Combine embeddings from different files."""
-    # Check if combined embeddings exist, and if not, aggregate them
-    for split in ["train", "test"]:
-        if not fsspec_exists(osp.join(embeds_path, f"{split}_embeds_combined.pt")):
-            storage_dict = {
-                "concat_avg_ws": [],
-                "rc_concat_avg_ws": [],
-                "chromosome": [],
-                "labels": [],
-                "distance_to_nearest_tss": [],
-                "tissue_embed": [],
-            }
-            for filename in fsspec_listdir(embeds_path):
-                if f"{split}_embeds_" in filename:
-                    log.warning(f"Loading data from: {filename}")
-                    with fsspec.open(filename, "rb") as f:
-                        tmp_data = torch.load(f)
-                    for key in storage_dict.keys():
-                        storage_dict[key].append(tmp_data[key])
-            storage_dict = concat_storage_dict_values(storage_dict)
-            log.warning(f"Saving combined data to: {embeds_path}/{split}_embeds_combined.pt")
-            with fsspec.open(osp.join(embeds_path, f"{split}_embeds_combined.pt"), "wb") as f:
-                torch.save(storage_dict, f)
+        log.warning(f"Saving combined data to: {combined_path}")
+        with fsspec.open(combined_path, "wb") as f:
+            torch.save(storage_dict, f)
 
 
 def main(args):
     """Main entry point."""
+    if (args.manual_num_shards is None) != (args.manual_shard_index is None):
+        raise ValueError("--manual_num_shards and --manual_shard_index must be set together.")
+    if args.manual_num_shards is not None:
+        if args.manual_num_shards < 1:
+            raise ValueError("--manual_num_shards must be positive.")
+        if not 0 <= args.manual_shard_index < args.manual_num_shards:
+            raise ValueError("--manual_shard_index must be in [0, manual_num_shards).")
+
     # Reproducibility
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
@@ -694,7 +1219,7 @@ def main(args):
     print(f"[RANK {dist.get_rank()}] Using device: {device}.")  # All processes print this
 
     # Init tokenizer
-    if is_mlbn_local(args.model_name_or_path):
+    if is_mlbn_local(args.model_name_or_path) or is_janusdna_local(args.model_name_or_path):
         tokenizer = CaduceusTokenizer(model_max_length=args.seq_len)
     elif "enformer" in args.model_name_or_path.lower():
         # Enformer tokenization requires having vocab of just `A,C,G,T,N` (in that order)
@@ -717,8 +1242,16 @@ def main(args):
 
     # Combine embeddings into single file
     dist.barrier()
+    if dist.get_rank() == 0 and not args.skip_combine:
+        expected_sizes = {split_name: len(split) for split_name, split in dataset.items() if split_name in args.splits}
+        combine_embeddings(
+            osp.join(args.downstream_save_dir, args.name),
+            orientation=args.eval_orientation,
+            splits=args.splits,
+            expected_sizes=expected_sizes,
+        )
+    dist.barrier()
     cleanup_distributed()
-    combine_embeddings(osp.join(args.downstream_save_dir, args.name))
 
 
 if __name__ == "__main__":
@@ -728,11 +1261,19 @@ if __name__ == "__main__":
                         help="Sequence length (in bp)..")
     parser.add_argument("--bp_per_token", type=int, default=1,
                         help="Number of base pairs per token.")
+    parser.add_argument("--window_size_bp", type=int, default=1536,
+                        help="Variant-centered readout width in base pairs. Use 1024 for the common-readout context study.")
     parser.add_argument("--model_name_or_path", type=str, default=None)
-    parser.add_argument("--mlbn_config", type=str, default=None,
-                        help="Path to local MLBN downstream config for model_name_or_path=mlbn-local.")
-    parser.add_argument("--mlbn_checkpoint", type=str, default=None,
-                        help="Path to local MLBN pretraining checkpoint for model_name_or_path=mlbn-local.")
+    parser.add_argument("--flipped_gari_config", "--mlbn_config", dest="mlbn_config", type=str, default=None,
+                        help="Path to the local Flipped-GARI downstream config.")
+    parser.add_argument("--flipped_gari_checkpoint", "--mlbn_checkpoint", dest="mlbn_checkpoint", type=str, default=None,
+                        help="Path to the local Flipped-GARI checkpoint.")
+    parser.add_argument("--janusdna_root", type=str, default=None,
+                        help="Path to a local JanusDNA repository for model_name_or_path=janusdna-local.")
+    parser.add_argument("--janusdna_config", type=str, default=None,
+                        help="Path to local JanusDNA model_config.json for model_name_or_path=janusdna-local.")
+    parser.add_argument("--janusdna_checkpoint", type=str, default=None,
+                        help="Path to local JanusDNA pretraining checkpoint for model_name_or_path=janusdna-local.")
     parser.add_argument("--vep_task_name", type=str, default="variant_effect_causal_eqtl",
                         help="Task key for InstaDeepAI/genomics-long-range-benchmark VEP data.")
     parser.add_argument("--download_retries", type=int, default=4,
@@ -741,8 +1282,22 @@ if __name__ == "__main__":
                         help="Socket timeout in seconds for reference-genome downloads.")
     parser.add_argument("--tokenize_batch_size", type=int, default=16,
                         help="Batch size for VEP sequence tokenization.")
+    parser.add_argument("--train_samples_per_tss_bucket", type=int, default=None,
+                        help="Before tokenization/embedding, keep a fixed stratified train subset per TSS bucket.")
+    parser.add_argument("--train_subset_seed", type=int, default=2222,
+                        help="Seed for the fixed pre-embedding VEP train subset.")
     parser.add_argument("--stream_tokenize", default=False, action="store_true",
                         help="Tokenize VEP examples inside the embedding DataLoader instead of saving token ids.")
+    parser.add_argument("--prepared_dataset_path", type=str, default=None,
+                        help="Shared raw-sequence VEP DatasetDict created by --prepare_dataset_only.")
+    parser.add_argument("--prepare_dataset_only", default=False, action="store_true",
+                        help="Build and audit --prepared_dataset_path without initializing distributed GPUs.")
+    parser.add_argument("--eval_orientation", choices=["rc", "flip"], default="rc",
+                        help="Paired orientation to dump: reverse-complement (rc) or plain reversal (flip).")
+    parser.add_argument("--splits", nargs="+", default=["train", "test"], choices=["train", "test"],
+                        help="Dataset splits to dump. Useful for adding sequence-reversed test embeddings to an existing train dump.")
+    parser.add_argument("--autocast_dtype", choices=["fp16", "bf16", "fp32"], default="fp16",
+                        help="Autocast dtype for embedding forward passes. Use bf16/fp32 for long Flipped-GARI runs.")
     parser.add_argument("--downstream_save_dir", type=str, default="./outputs/downstream/vep_embeddings",
                         help="Directory to save downstream task.")
     parser.add_argument("--name", type=str, default=None, help="Embeddings model name.")
@@ -751,10 +1306,21 @@ if __name__ == "__main__":
     parser.add_argument("--embed_dump_batch_size", type=int, default=1,
                         help="Batch size for embedding dump.")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers.")
+    parser.add_argument("--manual_num_shards", type=int, default=None,
+                        help="Override distributed world size for manually submitted shard jobs.")
+    parser.add_argument("--manual_shard_index", type=int, default=None,
+                        help="Override distributed rank for manually submitted shard jobs.")
+    parser.add_argument("--skip_combine", default=False, action="store_true",
+                        help="Only write this shard; do not combine split shards at the end.")
+    parser.add_argument("--skip_paired", default=False, action="store_true",
+                        help="Dump only canonical ref/alt embeddings and skip RC/flip paired forward passes.")
     opts, _ = parser.parse_known_args()
     log.warning("*** Args ************************")
     for k, v in vars(opts).items():
         log.warning(f"  - {k}: {v}")
     log.warning("******************************\n")
 
-    main(opts)
+    if opts.prepare_dataset_only:
+        prepare_shared_vep_dataset(opts)
+    else:
+        main(opts)

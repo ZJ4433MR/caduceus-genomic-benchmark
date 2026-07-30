@@ -1,0 +1,17 @@
+evaluation_view,task,mean_accuracy,sample_sd,n_split_seeds,selection_profile
+original_order,ME,0.7975,0.0239,5,fixed_batch64_lr1e-3
+original_order,CvI,0.9096,0.0016,5,taskwise_original_order_validation
+original_order,HvW,0.9637,0.0009,5,fixed_batch64_lr1e-3
+original_order,HE-C,0.7323,0.0026,5,taskwise_original_order_validation
+original_order,HE-E,0.8921,0.0029,5,taskwise_original_order_validation
+original_order,Reg,0.8800,0.0012,5,taskwise_original_order_validation
+original_order,Non-TATA,0.9132,0.0049,5,taskwise_original_order_validation
+original_order,OCR,0.7978,0.0024,5,taskwise_original_order_validation
+sequence_reversed,ME,0.7669,0.0362,5,fixed_formal_configuration
+sequence_reversed,CvI,0.7233,0.0119,5,fixed_formal_configuration
+sequence_reversed,HvW,0.5312,0.0073,5,fixed_formal_configuration
+sequence_reversed,HE-C,0.5804,0.0201,5,fixed_formal_configuration
+sequence_reversed,HE-E,0.4929,0.0038,5,taskwise_original_order_validation
+sequence_reversed,Reg,0.7478,0.0078,5,fixed_formal_configuration
+sequence_reversed,Non-TATA,0.6176,0.0155,5,fixed_formal_configuration
+sequence_reversed,OCR,0.5219,0.0066,5,fixed_formal_configuration

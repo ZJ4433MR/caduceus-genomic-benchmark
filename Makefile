@@ -1,21 +1,18 @@
-.PHONY: smoke table2 table3 table4 clean
+.PHONY: validate smoke archive clean
 
 PYTHON ?= python
 
+validate:
+	$(PYTHON) scripts/validate_package.py
+	$(PYTHON) scripts/verify_reported_results.py
+
 smoke:
-	$(PYTHON) -m compileall -q src caduceus scripts train.py
-	bash scripts/test_imports.sh
+	$(PYTHON) -m compileall -q src caduceus scripts train.py vep_embeddings.py vep_svm_eval.py
+	$(PYTHON) scripts/test_window_readout.py
 
-table2:
-	$(PYTHON) scripts/aggregate_results.py --input results/raw/table2_runs.csv --output results/tables/table2_main_results.csv
-
-table3:
-	$(PYTHON) scripts/aggregate_results.py --input results/raw/table3_same_budget_runs.csv --output results/tables/table3_same_budget_controls.csv
-
-table4:
-	$(PYTHON) scripts/aggregate_results.py --input results/raw/table4_ablation_runs.csv --output results/tables/table4_ablation.csv
+archive: validate
+	$(PYTHON) scripts/build_anonymous_archive.py
 
 clean:
-	rm -rf .pytest_cache __pycache__
+	rm -rf .pytest_cache __pycache__ dist
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
-

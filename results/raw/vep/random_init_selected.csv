@@ -1,0 +1,4 @@
+﻿"model_name","Distance to TSS","use_tissue","C","AUROC","AUROC_std","macro_AUROC_mean_over_buckets"
+"Flipped-GARI_random_init_131k_normal_hard_label_paper","0 - 30k","True","0.1","0.6625186721281304","0.0038648139382650884","0.5931908157498248"
+"Flipped-GARI_random_init_131k_normal_hard_label_paper","100k+","True","0.1","0.5467935737434955","0.0025395169675009634","0.5931908157498248"
+"Flipped-GARI_random_init_131k_normal_hard_label_paper","30 - 100k","True","0.3","0.5702602013778485","0.007445004509083331","0.5931908157498248"

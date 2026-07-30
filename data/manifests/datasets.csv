@@ -1,7 +1,5 @@
-dataset,task_group,input_length,task_type,metrics,role,availability
-hg38,masked_language_modeling,1024,pretraining,loss,MLBN-1k pretraining,download_script
-GenomicBenchmarks,legacy_downstream,variable,binary_or_multiclass_classification,accuracy,legacy comparison,public_package
-Caduceus_VEP,long_range_legacy,30000_to_131072,variant_effect_prediction,AUROC_or_task_metric,long-range legacy comparison,public_huggingface_dataset
-DNALongBench_eQTL,long_range_external,450000,binary_classification,AUROC,external validation,public_benchmark
-DNALongBench_ETGP,long_range_external,450000,binary_classification,AUROC_and_AUPRC,external validation,public_benchmark
-
+dataset,identifier,version,task,source,license_or_terms,redistributed,retrieval
+hg38_pretraining_assets,hg38.ml.fa_and_sequences_human.bed,accessed_2026-07,masked_nucleotide_pretraining,https://storage.googleapis.com/basenji_barnyard2/,source_terms,false,scripts/download_hg38_pretrain_data.sh
+GenomicBenchmarks,genomic-benchmarks,0.0.9_dataset_version_0,eight_sequence_classification_tasks,https://github.com/ML-Bioinfo-CEITEC/genomic_benchmarks,per_dataset_terms,false,scripts/download_genomicbenchmarks_data.py
+Genomics_Long_Range_Benchmark,InstaDeepAI/genomics-long-range-benchmark,accessed_2026-07,variant_effect_causal_eqtl,https://huggingface.co/datasets/InstaDeepAI/genomics-long-range-benchmark,CC_BY-NC-SA_4.0,false,vep_embeddings.py
+DNALongBench_ETGP,doi:10.7910/DVN/CTEQXX,version_1_2025-08-11,enhancer_target_gene_prediction,https://doi.org/10.7910/DVN/CTEQXX,CC0_1.0,false,scripts/download_dnalongbench_450k_data.py

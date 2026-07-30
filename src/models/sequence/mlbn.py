@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers.drop import DropPath
+from torch.utils.checkpoint import checkpoint
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba as Mamba1
@@ -29,7 +30,7 @@ def _make_mamba_mixer(input_dim, d_state, d_conv, expand, head_dim):
 
 
 def _encoder_drop_path_rates(num_blocks: int, max_rate: float):
-    """Linear stochastic depth schedule (timm ViT style): 0 �?max_rate across blocks."""
+    """Linear stochastic depth schedule (timm ViT style): 0 → max_rate across blocks."""
     if num_blocks <= 0:
         return []
     if max_rate <= 0.0:
@@ -104,7 +105,8 @@ def maybe_compile(fn, compile_mode=None):
     """
     条件性地应用 torch.compile
     Args:
-        fn: 要编译的函数或模�?        compile_mode: 编译模式 ('default', 'reduce-overhead', 'max-autotune', None=不编�?
+        fn: 要编译的函数或模块
+        compile_mode: 编译模式 ('default', 'reduce-overhead', 'max-autotune', None=不编译)
     Returns:
         编译后的函数或原函数
     """
@@ -241,7 +243,8 @@ class GradientEquilibrium(nn.Module):
         """
         x_f, x_b = x[0], x[1]
 
-        # 优化: 使用 torch.linalg.vector_norm 替代手动计算，更快且数值稳�?        norm_f = torch.linalg.vector_norm(x_f) + self.eps
+        # 优化: 使用 torch.linalg.vector_norm 替代手动计算，更快且数值稳定
+        norm_f = torch.linalg.vector_norm(x_f) + self.eps
         norm_b = torch.linalg.vector_norm(x_b) + self.eps
 
         # Min-norm guard
@@ -267,6 +270,12 @@ class GradientEquilibrium(nn.Module):
             boost = torch.sqrt(ratio / (upper + self.eps))
             x_b = x_b * boost
 
+        # The learnable guard scalars are otherwise data-conditionally absent
+        # from the autograd graph.  Keep a zero-valued dependency so DDP sees
+        # the same parameter set on every rank and on every accumulation step.
+        guard_dependency = (self._min_norm_param + self.beta) * 0.0
+        x_f = x_f + guard_dependency
+
         return torch.stack([x_f, x_b], dim=0)
 
 
@@ -283,6 +292,7 @@ class Attention(nn.Module):
         use_rope: bool = True,
         rope_base: float = 10000.0,
         cls_index: int | str | None = None,
+        rope_interleaved: bool = False,
     ):
         """
         input_dim: input dimension
@@ -297,14 +307,18 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = input_dim // num_heads
         self.input_dim = input_dim
-        # 分离 Q/K �?V 的投影：Q/K 来自同一输入，V 来自另一输入
-        self.qk = nn.Linear(input_dim, input_dim * 2)  # Q �?K
+        # 分离 Q/K 和 V 的投影：Q/K 来自同一输入，V 来自另一输入
+        self.qk = nn.Linear(input_dim, input_dim * 2)  # Q 和 K
         self.v = nn.Linear(input_dim, input_dim)  # V
         self.dropout = nn.Dropout(dropout_rate)
         self.norm = nn.LayerNorm(input_dim)
         self.use_rope = use_rope
         self.rope_base = rope_base
         self.cls_index = cls_index
+        # False preserves the positional convention used by existing MLBN
+        # checkpoints. New checkpoints can opt into the mathematically
+        # consistent adjacent-pair convention used by _rotate_every_two.
+        self.rope_interleaved = rope_interleaved
 
     def _build_rope_cache(self, seq_len: int, device, dtype):
         # RoPE expects even head_dim to pair dimensions
@@ -312,10 +326,12 @@ class Attention(nn.Module):
             raise ValueError(f"RoPE requires even head_dim, got {self.head_dim}")
         half_dim = self.head_dim // 2
         inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half_dim, device=device, dtype=torch.float32) / half_dim))
-        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half_dim, device=device, dtype=torch.float32) / half_dim))
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, inv_freq)  # (seq_len, half_dim)
-        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
+        if self.rope_interleaved:
+            emb = torch.repeat_interleave(freqs, 2, dim=-1)
+        else:
+            emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos()[None, None, :, :]  # (1,1,seq_len,head_dim)
         sin = emb.sin()[None, None, :, :]  # (1,1,seq_len,head_dim)
         cos = cos.to(dtype=dtype)
@@ -369,19 +385,19 @@ class Attention(nn.Module):
     def forward(self, x_qk, x_v):
         """
         input:
-            x_qk: (batch_size, seq_len, input_dim) - 用于生成 Q �?K
+            x_qk: (batch_size, seq_len, input_dim) - 用于生成 Q 和 K
             x_v: (batch_size, seq_len, input_dim) - 用于生成 V
         output:
             attention: (batch_size, seq_len, input_dim)
         """
         batch_size, seq_len, _ = x_qk.shape
 
-        # �?x_qk 生成 Q �?K
+        # 从 x_qk 生成 Q 和 K
         qk = self.qk(x_qk).reshape(batch_size, seq_len, 2, self.num_heads, self.head_dim)
         q, k = qk.unbind(dim=2)
         q, k = q.transpose(1, 2), k.transpose(1, 2)  # (batch, heads, seq_len, head_dim)
 
-        # �?x_v 生成 V
+        # 从 x_v 生成 V
         v = self.v(x_v).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.transpose(1, 2)  # (batch, heads, seq_len, head_dim)
 
@@ -390,8 +406,8 @@ class Attention(nn.Module):
             q, k = self._apply_rope(q, k)
 
         # 使用 Flash Attention (PyTorch 2.0+, A800 GPU 自动启用)
-        # scaled_dot_product_attention 会自动选择最优实�?
-        # - Flash Attention (最快，需�?A100/A800/H100)
+        # scaled_dot_product_attention 会自动选择最优实现:
+        # - Flash Attention (最快，需要 A100/A800/H100)
         # - Memory-Efficient Attention
         # - 标准数学实现
         dropout_p = self.dropout.p if self.training else 0.0
@@ -425,6 +441,7 @@ class CrossAttention_pro(nn.Module):
         use_rope: bool = True,
         rope_base: float = 10000.0,
         cls_index: int | str | None = None,
+        rope_interleaved: bool = False,
     ):
         """
         input_dim: input dimension
@@ -438,13 +455,14 @@ class CrossAttention_pro(nn.Module):
         self.num_heads = num_heads
         self.head_dim = input_dim // num_heads
         self.input_dim = input_dim
-        # 优化: 合并 Q/K/V 投影为单�?Linear，减�?kernel 调用 (~5-10% 提�?
+        # 优化: 合并 Q/K/V 投影为单个 Linear，减少 kernel 调用 (~5-10% 提速)
         self.qkv = nn.Linear(input_dim, input_dim * 3)
         self.dropout = nn.Dropout(dropout_rate)
         self.norm = nn.LayerNorm(input_dim)
         self.use_rope = use_rope
         self.rope_base = rope_base
         self.cls_index = cls_index
+        self.rope_interleaved = rope_interleaved
 
     def _build_rope_cache(self, seq_len: int, device, dtype):
         # RoPE expects even head_dim to pair dimensions
@@ -454,7 +472,10 @@ class CrossAttention_pro(nn.Module):
         inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half_dim, device=device, dtype=torch.float32) / half_dim))
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, inv_freq)  # (seq_len, half_dim)
-        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
+        if self.rope_interleaved:
+            emb = torch.repeat_interleave(freqs, 2, dim=-1)
+        else:
+            emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos()[None, None, :, :]  # (1,1,seq_len,head_dim)
         sin = emb.sin()[None, None, :, :]  # (1,1,seq_len,head_dim)
         cos = cos.to(dtype=dtype)
@@ -514,11 +535,11 @@ class CrossAttention_pro(nn.Module):
         x_f, x_b = x[0], x[1]
         batch_size, seq_len, _ = x_f.shape
 
-        # 优化: 合并 QKV 投影，单�?Linear 计算�?split
+        # 优化: 合并 QKV 投影，单次 Linear 计算后 split
         qkv_f = self.qkv(x_f).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv_b = self.qkv(x_b).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
 
-        # 分离 Q, K, V 并转换维�? (batch, heads, seq_len, head_dim)
+        # 分离 Q, K, V 并转换维度: (batch, heads, seq_len, head_dim)
         q_f, k_f, v_f = qkv_f.unbind(dim=2)
         q_b, k_b, v_b = qkv_b.unbind(dim=2)
         q_f, k_f, v_f = q_f.transpose(1, 2), k_f.transpose(1, 2), v_f.transpose(1, 2)
@@ -530,8 +551,8 @@ class CrossAttention_pro(nn.Module):
             q_b, k_b = self._apply_rope(q_b, k_b)
 
         # 使用 Flash Attention (PyTorch 2.0+, A800 GPU 自动启用)
-        # scaled_dot_product_attention 会自动选择最优实�?
-        # - Flash Attention (最快，需�?A100/A800/H100)
+        # scaled_dot_product_attention 会自动选择最优实现:
+        # - Flash Attention (最快，需要 A100/A800/H100)
         # - Memory-Efficient Attention
         # - 标准数学实现
         dropout_p = self.dropout.p if self.training else 0.0
@@ -574,6 +595,9 @@ class fusion_block(nn.Module):
         dropout_rate2,
         cls_rope_mode=None,
         drop_path_rate: float = 0.0,
+        enable_cross_attention: bool = True,
+        discrepancy_mode: str = "squared_difference",
+        rope_interleaved: bool = False,
     ):
         """
         input_dim: input dimension
@@ -600,17 +624,44 @@ class fusion_block(nn.Module):
         )
         self.GradientEquilibrium = GradientEquilibrium()
         self.cls_rope_mode_cfg = cls_rope_mode
-        self.CrossAttention = CrossAttention_pro(input_dim, num_heads, dropout_rate2, cls_index=cls_rope_mode)
-        self.Attention = Attention(input_dim, num_heads, dropout_rate2, cls_index=cls_rope_mode)
+        self.enable_cross_attention = bool(enable_cross_attention)
+        if discrepancy_mode not in {"common_duplicate", "squared_difference"}:
+            raise ValueError(
+                "discrepancy_mode must be 'common_duplicate' or 'squared_difference'; "
+                f"got {discrepancy_mode!r}"
+            )
+        self.discrepancy_mode = discrepancy_mode
+        self.CrossAttention = CrossAttention_pro(
+            input_dim,
+            num_heads,
+            dropout_rate2,
+            cls_index=cls_rope_mode,
+            rope_interleaved=rope_interleaved,
+        )
+        self.Attention = Attention(
+            input_dim,
+            num_heads,
+            dropout_rate2,
+            cls_index=cls_rope_mode,
+            rope_interleaved=rope_interleaved,
+        )
         self.Linear1 = nn.Linear(input_dim, input_dim)
         self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定�?        self.norm = nn.LayerNorm(input_dim)
+        # 添加多个Norm层以提高训练稳定性
+        self.norm = nn.LayerNorm(input_dim)
         self.norm_add = nn.LayerNorm(input_dim)
         self.norm_sub = nn.LayerNorm(input_dim)
         self.norm_cross_attention = nn.LayerNorm(input_dim)
         self.norm_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向�?        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
+        # 分别正则化前向和后向链
+        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
         self.norm_after_odbc_b = nn.LayerNorm(input_dim)  # 后向链ODBC后正则化
+
+        if not self.enable_cross_attention:
+            # Keep state_dict/total-parameter compatibility while making the
+            # inactive A0 branch explicit to the optimizer and DDP reducer.
+            self.CrossAttention.requires_grad_(False)
+            self.norm_cross_attention.requires_grad_(False)
 
         self.GELU = nn.GELU()
         # Initialize parameters
@@ -645,7 +696,8 @@ class fusion_block(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "qkv" in name:
-                    # QKV 合并层使用较小初始化避免注意力权重爆�?                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    # QKV 合并层使用较小初始化避免注意力权重爆炸
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
                 else:
@@ -730,9 +782,16 @@ class fusion_block(nn.Module):
 
         # CrossAttention with normalization - 标准 Pre-LN 残差连接
         x = torch.stack([x[0], x[1].flip(1)], dim=0)
-        x = x + self.CrossAttention(self.norm_cross_attention(x))
-        x_add, x_sub = self.norm_add(x[0] + x[1]), self.norm_sub(-((x[0] - x[1]) ** 2))
-        x = self.norm_attention(self.Attention(x_sub, x_add)) + x_add
+        if self.enable_cross_attention:
+            x = x + self.CrossAttention(self.norm_cross_attention(x))
+        x_add = self.norm_add(x[0] + x[1])
+        if self.discrepancy_mode == "common_duplicate":
+            # Conservative B0 control: keep the query path and its parameters
+            # active, but remove access to x_f - x_b directional discrepancy.
+            x_query = self.norm_sub(x_add)
+        else:
+            x_query = self.norm_sub(-((x[0] - x[1]) ** 2))
+        x = self.norm_attention(self.Attention(x_query, x_add)) + x_add
         delta = self.GELU(self.Linear2(x))
         x = Tl_1[0] + self.drop_path(delta)
         return x
@@ -756,6 +815,8 @@ class MLBN(nn.Module):
         dropout_rate2,
         cls_rope_mode=None,
         drop_path_rate: float = 0.0,
+        enable_cross_attention: bool = True,
+        rope_interleaved: bool = False,
     ):
         """
         input_dim: input dimension
@@ -782,14 +843,27 @@ class MLBN(nn.Module):
         )
         self.GradientEquilibrium = GradientEquilibrium()
         self.cls_rope_mode_cfg = cls_rope_mode
-        self.CrossAttention = CrossAttention_pro(input_dim, num_heads, dropout_rate2, cls_index=cls_rope_mode)
+        self.enable_cross_attention = bool(enable_cross_attention)
+        self.CrossAttention = CrossAttention_pro(
+            input_dim,
+            num_heads,
+            dropout_rate2,
+            cls_index=cls_rope_mode,
+            rope_interleaved=rope_interleaved,
+        )
         self.Linear1 = nn.Linear(input_dim, input_dim)
         self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定�?        self.norm = nn.LayerNorm(input_dim)
+        # 添加多个Norm层以提高训练稳定性
+        self.norm = nn.LayerNorm(input_dim)
         self.norm_cross_attention = nn.LayerNorm(input_dim)
         self.norm_after_cross_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向�?        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
+        # 分别正则化前向和后向链
+        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
         self.norm_after_odbc_b = nn.LayerNorm(input_dim)  # 后向链ODBC后正则化
+
+        if not self.enable_cross_attention:
+            self.CrossAttention.requires_grad_(False)
+            self.norm_cross_attention.requires_grad_(False)
 
         self.GELU = nn.GELU()
         # Initialize parameters
@@ -824,7 +898,8 @@ class MLBN(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "qkv" in name:
-                    # QKV 合并层使用较小初始化避免注意力权重爆�?                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    # QKV 合并层使用较小初始化避免注意力权重爆炸
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
                 else:
@@ -910,7 +985,8 @@ class MLBN(nn.Module):
 
         # CrossAttention with normalization - 标准 Pre-LN 残差连接
         x = torch.stack([x[0], x[1].flip(1)], dim=0)
-        x = x + self.CrossAttention(self.norm_cross_attention(x))
+        if self.enable_cross_attention:
+            x = x + self.CrossAttention(self.norm_cross_attention(x))
         delta = self.Linear2(self.norm_after_cross_attention(x))
         Tl = Tl_1 + self.drop_path(delta)
         return Tl
@@ -940,7 +1016,8 @@ class MLBN(nn.Module):
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重�?                module_params = 0
+                # 只统计该模块独有的参数（去重）
+                module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
                     if param_id not in seen_params:
@@ -1016,6 +1093,11 @@ class MLBN_encoder(nn.Module):
         dropout_rate2,
         cls_rope_mode=None,
         drop_path_rate: float = 0.0,
+        checkpoint_blocks: bool = False,
+        enable_cross_attention: bool = True,
+        discrepancy_mode: str = "squared_difference",
+        rope_interleaved: bool = False,
+        zero_init_residual: bool = False,
     ):
         """
         L: number of MLBN blocks to stack
@@ -1030,6 +1112,11 @@ class MLBN_encoder(nn.Module):
         drop_path_rate: max stochastic depth; linear 0→max over L MLBN blocks + fusion block (timm ViT)
         """
         super().__init__()
+        self.checkpoint_blocks = checkpoint_blocks
+        self.enable_cross_attention = bool(enable_cross_attention)
+        self.discrepancy_mode = discrepancy_mode
+        self.rope_interleaved = bool(rope_interleaved)
+        self.zero_init_residual = bool(zero_init_residual)
         num_blocks = L + 1
         dpr = _encoder_drop_path_rates(num_blocks, drop_path_rate)
         self.blocks = nn.ModuleList(
@@ -1044,7 +1131,10 @@ class MLBN_encoder(nn.Module):
                     dropout_rate1,
                     num_heads,
                     dropout_rate2,
+                    cls_rope_mode=cls_rope_mode,
                     drop_path_rate=dpr[i],
+                    enable_cross_attention=enable_cross_attention,
+                    rope_interleaved=rope_interleaved,
                 )
                 for i in range(L)
             ]
@@ -1059,7 +1149,11 @@ class MLBN_encoder(nn.Module):
                     dropout_rate1,
                     num_heads,
                     dropout_rate2,
+                    cls_rope_mode=cls_rope_mode,
                     drop_path_rate=dpr[L],
+                    enable_cross_attention=enable_cross_attention,
+                    discrepancy_mode=discrepancy_mode,
+                    rope_interleaved=rope_interleaved,
                 )
             ]
         )
@@ -1079,6 +1173,15 @@ class MLBN_encoder(nn.Module):
 
         # Initialize parameters for all blocks
         self.apply_encoder_initialization()
+        if self.zero_init_residual:
+            # Start every residual branch as an exact identity.  This is
+            # opt-in so existing checkpoints/configs retain legacy behavior,
+            # while deep randomly initialized ablations avoid a product of
+            # large normalization Jacobians on the first backward pass.
+            for block in self.blocks:
+                nn.init.zeros_(block.Linear2.weight)
+                if block.Linear2.bias is not None:
+                    nn.init.zeros_(block.Linear2.bias)
 
     def _init_encoder_weights(self):
         """Custom encoder weights initialization"""
@@ -1089,7 +1192,8 @@ class MLBN_encoder(nn.Module):
             for name, module in block.named_modules():
                 if isinstance(module, nn.Linear):
                     if "qkv" in name:
-                        # QKV 合并层使用较小初始化避免注意力权重爆�?                        nn.init.xavier_uniform_(module.weight, gain=0.5 * residual_scale)
+                        # QKV 合并层使用较小初始化避免注意力权重爆炸
+                        nn.init.xavier_uniform_(module.weight, gain=0.5 * residual_scale)
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
                     else:
@@ -1163,7 +1267,8 @@ class MLBN_encoder(nn.Module):
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重�?                module_params = 0
+                # 只统计该模块独有的参数（去重）
+                module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
                     if param_id not in seen_params:
@@ -1240,13 +1345,17 @@ class MLBN_encoder(nn.Module):
         x = torch.stack([x, x], dim=0)
 
         for block in self.blocks:
-            x = block(x)
+            if self.checkpoint_blocks and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return x
 
 
 class vision_fusion_block(nn.Module):
     """
-    Vision Fusion Layer: 融合前向和后向分支，考虑 anchor token 的特殊处�?    """
+    Vision Fusion Layer: 融合前向和后向分支，考虑 anchor token 的特殊处理
+    """
 
     def __init__(
         self,
@@ -1296,12 +1405,14 @@ class vision_fusion_block(nn.Module):
         self.Attention = Attention(input_dim, num_heads, dropout_rate2, cls_index=self.cls_rope_mode_cfg)
         self.Linear1 = nn.Linear(input_dim, input_dim)
         self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定�?        self.norm = nn.LayerNorm(input_dim)
+        # 添加多个Norm层以提高训练稳定性
+        self.norm = nn.LayerNorm(input_dim)
         self.norm_add = nn.LayerNorm(input_dim)
         self.norm_sub = nn.LayerNorm(input_dim)
         self.norm_cross_attention = nn.LayerNorm(input_dim)
         self.norm_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向�?        self.norm_after_odbc_f = nn.LayerNorm(input_dim)
+        # 分别正则化前向和后向链
+        self.norm_after_odbc_f = nn.LayerNorm(input_dim)
         self.norm_after_odbc_b = nn.LayerNorm(input_dim)
 
         self.GELU = nn.GELU()
@@ -1636,7 +1747,8 @@ class VisionMLBN(nn.Module):
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重�?                module_params = 0
+                # 只统计该模块独有的参数（去重）
+                module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
                     if param_id not in seen_params:
@@ -1875,7 +1987,8 @@ class VisionMLBN_encoder(nn.Module):
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重�?                module_params = 0
+                # 只统计该模块独有的参数（去重）
+                module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
                     if param_id not in seen_params:

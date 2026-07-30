@@ -1,21 +1,10 @@
 # Checkpoints
 
-Large checkpoint files are not included in this repository.
+Checkpoint binaries are not included in the reviewer ZIP because the complete
+set exceeds the supplementary archive budget. `manifest.csv` records the
+scientific profile and SHA-256 digest of each pretraining checkpoint used by
+the included experiment paths.
 
-Expected local layout:
-
-```text
-checkpoints/
-  mlbn_1k/
-    last.ckpt
-  mamba2_1k/
-    last.ckpt
-  mamba2_revph_1k/
-    last.ckpt
-  caduceus/
-    <optional cached public Hugging Face models>
-```
-
-For public Caduceus baselines, scripts can also read directly from Hugging Face
-model identifiers when network access is available.
-
+The package contains exact training configurations to regenerate these
+checkpoints. Any separately transferred checkpoint must match the listed
+digest before evaluation.

@@ -1,5 +1,5 @@
 _name_: dnalongbench_450k
-data_root: data/dnalongbench/data_long_range_dna
+data_root: data/raw/dnalongbench
 task_name: etgp
 subset: null
 train_val_split_seed: 1
@@ -22,4 +22,5 @@ conjoin_train: false
 conjoin_test: false
 reverse_val: false
 reverse_test: false
+return_anchor_metadata: false
 __l_max: ${.max_length}

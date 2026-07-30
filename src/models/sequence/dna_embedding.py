@@ -4,9 +4,11 @@ Backbones from LM pre-training models, used for downstream tasks.
 """
 
 from functools import partial
+import importlib
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from flash_attn.utils.generation import GenerationMixin
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MixerModel
@@ -170,6 +172,7 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
             cache_dir=None,
             revision=None,
             local_files_only=False,
+            checkpoint_blocks=False,
     ):
         super(DNAEmbeddingModel, self).__init__()  # nn.Module.__init__()
         self.hf_model_name_or_path = hf_model_name_or_path
@@ -204,9 +207,82 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
 
         self.conjoin_train = conjoin_train
         self.conjoin_test = conjoin_test
+        self.checkpoint_blocks = checkpoint_blocks
+
+    def _checkpointed_hf_hidden_states(self, input_ids):
+        """Run the trusted Caduceus backbone with activation checkpointing per block."""
+        backbone = getattr(self.caduceus, "backbone", None)
+        if backbone is None:
+            raise RuntimeError("Caduceus block checkpointing requires a backbone attribute.")
+
+        hidden_states = backbone.embeddings(input_ids)
+        residual = None
+        for layer in backbone.layers:
+            if residual is None:
+                def run_first_layer(hidden, layer=layer):
+                    return layer(hidden, None, inference_params=None)
+
+                hidden_states, residual = checkpoint(
+                    run_first_layer,
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                def run_layer(hidden, residual_input, layer=layer):
+                    return layer(hidden, residual_input, inference_params=None)
+
+                hidden_states, residual = checkpoint(
+                    run_layer,
+                    hidden_states,
+                    residual,
+                    use_reentrant=False,
+                )
+
+        if not backbone.fused_add_norm:
+            if backbone.rcps:
+                return backbone.norm_f(hidden_states, residual=residual, prenorm=False)
+            residual = hidden_states + residual if residual is not None else hidden_states
+            return backbone.norm_f(residual.to(dtype=backbone.norm_f.weight.dtype))
+
+        model_module = importlib.import_module(backbone.__class__.__module__)
+        norm_name = "rms_norm_fn" if self.config.rms_norm else "layer_norm_fn"
+        fused_add_norm_fn = getattr(model_module, norm_name)
+        if backbone.rcps:
+            half_channels = hidden_states.shape[-1] // 2
+            hidden_states_fwd = fused_add_norm_fn(
+                hidden_states[..., :half_channels],
+                backbone.norm_f.weight,
+                backbone.norm_f.bias,
+                eps=backbone.norm_f.eps,
+                residual=residual[..., :half_channels],
+                prenorm=False,
+                residual_in_fp32=backbone.residual_in_fp32,
+            )
+            hidden_states_rc = fused_add_norm_fn(
+                hidden_states[..., half_channels:].flip(dims=[-2, -1]),
+                backbone.norm_f.weight,
+                backbone.norm_f.bias,
+                eps=backbone.norm_f.eps,
+                residual=residual[..., half_channels:].flip(dims=[-2, -1]),
+                prenorm=False,
+                residual_in_fp32=backbone.residual_in_fp32,
+            )
+            return torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
+
+        return fused_add_norm_fn(
+            hidden_states,
+            backbone.norm_f.weight,
+            backbone.norm_f.bias,
+            eps=backbone.norm_f.eps,
+            residual=residual,
+            prenorm=False,
+            residual_in_fp32=backbone.residual_in_fp32,
+        )
 
     def _hidden_states(self, input_ids):
         if self._uses_hf_model:
+            if self.checkpoint_blocks and self.training:
+                return self._checkpointed_hf_hidden_states(input_ids)
             outputs = self.caduceus(input_ids=input_ids, return_dict=True)
             if hasattr(outputs, "last_hidden_state"):
                 return outputs.last_hidden_state
@@ -253,6 +329,12 @@ class DNAEmbeddingModelMLBN(nn.Module):
             pad_token_id: int = 4,
             conjoin_train: bool = False,
             conjoin_test: bool = False,
+            checkpoint_blocks: bool = False,
+            cls_rope_mode=None,
+            enable_cross_attention: bool = True,
+            discrepancy_mode: str = "squared_difference",
+            rope_interleaved: bool = False,
+            zero_init_residual: bool = False,
             device=None,
             dtype=None,
             **kwargs,
@@ -275,7 +357,13 @@ class DNAEmbeddingModelMLBN(nn.Module):
             dropout_rate1=dropout_rate1,
             num_heads=num_heads,
             dropout_rate2=dropout_rate2,
+            cls_rope_mode=cls_rope_mode,
             drop_path_rate=drop_path_rate,
+            checkpoint_blocks=checkpoint_blocks,
+            enable_cross_attention=enable_cross_attention,
+            discrepancy_mode=discrepancy_mode,
+            rope_interleaved=rope_interleaved,
+            zero_init_residual=zero_init_residual,
         )
         self.norm = nn.LayerNorm(d_model, **factory_kwargs)
 
@@ -318,6 +406,11 @@ class MLBNLMHeadModel(nn.Module):
             embed_dropout: float = 0.0,
             pad_token_id: int = 4,
             tie_embeddings: bool = True,
+            cls_rope_mode=None,
+            enable_cross_attention: bool = True,
+            discrepancy_mode: str = "squared_difference",
+            rope_interleaved: bool = False,
+            zero_init_residual: bool = False,
             device=None,
             dtype=None,
             **kwargs,
@@ -339,7 +432,12 @@ class MLBNLMHeadModel(nn.Module):
             dropout_rate1=dropout_rate1,
             num_heads=num_heads,
             dropout_rate2=dropout_rate2,
+            cls_rope_mode=cls_rope_mode,
             drop_path_rate=drop_path_rate,
+            enable_cross_attention=enable_cross_attention,
+            discrepancy_mode=discrepancy_mode,
+            rope_interleaved=rope_interleaved,
+            zero_init_residual=zero_init_residual,
         )
         self.norm = nn.LayerNorm(d_model, **factory_kwargs)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)

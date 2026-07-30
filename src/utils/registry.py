@@ -20,6 +20,7 @@ scheduler = {
     "linear_warmup": "transformers.get_linear_schedule_with_warmup",
     "cosine_warmup": "transformers.get_cosine_schedule_with_warmup",
     "cosine_warmup_timm": "src.utils.optim.schedulers.TimmCosineLRScheduler",
+    "proportional_cosine_warmup_timm": "src.utils.optim.schedulers.ProportionalTimmCosineLRScheduler",
 }
 
 model = {
@@ -28,12 +29,14 @@ model = {
     "mamba_lm": "mamba_ssm.models.mixer_seq_simple.MambaLMHeadModel",
     "caduceus_lm": "caduceus.modeling_caduceus.CaduceusForMaskedLM",
     "mlbn_lm": "src.models.sequence.dna_embedding.MLBNLMHeadModel",
+    "flipped_gari_lm": "src.models.sequence.dna_embedding.MLBNLMHeadModel",
 
     # Downstream task embedding backbones
     "dna_embedding": "src.models.sequence.dna_embedding.DNAEmbeddingModel",
     "dna_embedding_mamba": "src.models.sequence.dna_embedding.DNAEmbeddingModelMamba",
     "dna_embedding_caduceus": "src.models.sequence.dna_embedding.DNAEmbeddingModelCaduceus",
     "dna_embedding_mlbn": "src.models.sequence.dna_embedding.DNAEmbeddingModelMLBN",
+    "dna_embedding_flipped_gari": "src.models.sequence.dna_embedding.DNAEmbeddingModelMLBN",
 
     # Baseline for genomics benchmark
     "genomics_benchmark_cnn": "src.models.baseline.genomics_benchmark_cnn.GenomicsBenchmarkCNN",

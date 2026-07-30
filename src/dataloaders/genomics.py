@@ -18,11 +18,6 @@ from caduceus.tokenization_caduceus import CaduceusTokenizer
 import src.utils.train
 from src.dataloaders.base import SequenceDataset, default_data_path
 from src.dataloaders.datasets.genomic_bench_dataset import GenomicBenchmarkDataset
-from src.dataloaders.datasets.dnalongbench_dataset import (
-    DNALongBenchETGPDataset,
-    DNALongBenchEQTLDataset,
-    SUPPORTED_EQTL_CELL_TYPES,
-)
 from src.dataloaders.datasets.hg38_char_tokenizer import CharacterTokenizer
 from src.dataloaders.datasets.hg38_dataset import HG38Dataset
 from src.dataloaders.datasets.nucleotide_transformer_dataset import NucleotideTransformerDataset
@@ -30,6 +25,28 @@ from src.dataloaders.fault_tolerant_sampler import FaultTolerantDistributedSampl
 from src.dataloaders.fault_tolerant_sampler import RandomFaultTolerantSampler
 
 logger = src.utils.train.get_logger(__name__)
+
+
+def _load_dnalongbench_symbols():
+    """Load DNALongBench-only dependencies lazily.
+
+    GenomicBenchmarks runs import this module too, but do not need the
+    DNALongBench stack. Keeping the import local avoids requiring optional
+    DNALongBench dependencies (e.g. kipoiseq) for unrelated GB evaluation.
+    """
+    try:
+        from src.dataloaders.datasets.dnalongbench_dataset import (
+            DNALongBenchETGPDataset,
+            DNALongBenchEQTLDataset,
+            SUPPORTED_EQTL_CELL_TYPES,
+        )
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "DNALongBench450K requires optional DNALongBench dependencies "
+            "(for example kipoiseq). Install them before using the eQTL/ETGP "
+            "dataloaders."
+        ) from exc
+    return DNALongBenchETGPDataset, DNALongBenchEQTLDataset, SUPPORTED_EQTL_CELL_TYPES
 
 
 class HG38(SequenceDataset):
@@ -437,7 +454,7 @@ class DNALongBench450K(HG38):
             reverse_val=False, reverse_test=False, max_length=450000, use_padding=True,
             padding_side="right", add_eos=False, batch_size=1, batch_size_eval=None,
             num_workers=0, shuffle=True, shuffle_eval=False, pin_memory=False,
-            drop_last=False, *args, **kwargs):
+            drop_last=False, return_anchor_metadata=False, *args, **kwargs):
         self.task_name = task_name
         self.data_root = data_root
         self.subset = subset
@@ -461,6 +478,7 @@ class DNALongBench450K(HG38):
         self.shuffle_eval = shuffle_eval
         self.pin_memory = pin_memory
         self.drop_last = drop_last
+        self.return_anchor_metadata = return_anchor_metadata
 
     def setup(self, stage=None):
         if self.tokenizer_name == "char":
@@ -492,6 +510,7 @@ class DNALongBench450K(HG38):
             reverse_aug=self.reverse_aug,
             conjoin_train=self.conjoin_train,
             conjoin_test=self.conjoin_test,
+            return_anchor_metadata=self.return_anchor_metadata,
         )
         self.dataset_val = dataset_cls(
             root_path=root_path,
@@ -504,6 +523,7 @@ class DNALongBench450K(HG38):
             reverse_sequence=self.reverse_val,
             conjoin_train=self.conjoin_train,
             conjoin_test=self.conjoin_test,
+            return_anchor_metadata=self.return_anchor_metadata,
         )
         self.dataset_test = dataset_cls(
             root_path=root_path,
@@ -516,10 +536,17 @@ class DNALongBench450K(HG38):
             reverse_sequence=self.reverse_test,
             conjoin_train=self.conjoin_train,
             conjoin_test=self.conjoin_test,
+            return_anchor_metadata=self.return_anchor_metadata,
         )
 
     def _resolve_dataset(self):
         from pathlib import Path
+
+        (
+            dnalongbench_etgp_dataset,
+            dnalongbench_eqtl_dataset,
+            supported_eqtl_cell_types,
+        ) = _load_dnalongbench_symbols()
 
         data_root = Path(self.data_root)
         if self.task_name in {"etgp", "enhancer_target_gene_prediction"}:
@@ -529,14 +556,14 @@ class DNALongBench450K(HG38):
                 data_root,
             ]
             config_name = "CRISPRi_EPI_K562_hg19.config"
-            dataset_cls = DNALongBenchETGPDataset
+            dataset_cls = dnalongbench_etgp_dataset
         elif self.task_name in {"eqtl", "eqtl_prediction"}:
-            subset = self.subset or SUPPORTED_EQTL_CELL_TYPES[0]
-            if subset not in SUPPORTED_EQTL_CELL_TYPES:
-                raise ValueError(f"Unsupported eQTL subset {subset}; expected one of {SUPPORTED_EQTL_CELL_TYPES}.")
+            subset = self.subset or supported_eqtl_cell_types[0]
+            if subset not in supported_eqtl_cell_types:
+                raise ValueError(f"Unsupported eQTL subset {subset}; expected one of {supported_eqtl_cell_types}.")
             candidates = [data_root / "eQTL", data_root / "eqtl", data_root]
             config_name = f"gtex_hg38.{subset}.config"
-            dataset_cls = DNALongBenchEQTLDataset
+            dataset_cls = dnalongbench_eqtl_dataset
         else:
             raise ValueError("DNALongBench450K task_name must be etgp or eqtl.")
 

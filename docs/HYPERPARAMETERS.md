@@ -1,28 +1,74 @@
-# Hyperparameter Reporting
+# Hyperparameters
 
-For every model in the paper, report both the final values and the searched
-ranges.
+## Masked-Nucleotide Pretraining
 
-Minimum fields:
+All profiles use AdamW with betas `(0.9, 0.95)`, weight decay 0.1,
+mask probability 0.15, no sequence-reversal augmentation, and no
+reverse-complement augmentation.
 
-- Model name.
-- Pretraining context length.
-- Model dimension.
-- Number of layers.
-- Number of heads where applicable.
-- Kernel size and state dimension where applicable.
-- Optimizer.
-- Learning rate.
-- Weight decay.
-- Scheduler.
-- Warmup steps.
-- Max steps or epochs.
-- Batch size and global batch size.
-- Dropout and drop path.
-- Random seeds.
-- Checkpoint selection rule.
+| Profile | Context | d | Blocks | Steps | Peak LR | Warmup | Global / per-GPU batch | GPUs | Precision | Clip |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| GB | 1,024 bp | 80 | 3 | 16,000 | 1.5e-3 | 1,600 | 1,024 / 32 | 4 | FP16 | 1.0 |
+| VEP | 1,024 bp | 192 | 12 | 16,000 | 1.0e-4 | 3,200 | 1,024 / 8 | 8 | FP32 | 0.5 |
+| ETGP base | 1,024 bp | 192 | 13 | 16,000 | 1.0e-4 | 3,200 | 1,024 / 8 | 8 | FP32 | 0.5 |
+| ETGP 2-kb continuation | 2,048 bp | 192 | 13 | 2,000 | 1.0e-4 | 100 | 512 / 4 | 4 | FP32 | 0.5 |
+| ETGP 5-kb continuation | 5,120 bp | 192 | 13 | 5,000 | 1.0e-4 | 100 | 200 / 1 | 4 | FP32 | 0.5 |
 
-The same-budget comparison should explicitly show that Mamba2-1k,
-Mamba2-RevPh-1k, and MLBN-1k share the intended pretraining context and
-training-budget constraints.
+The continuation profiles use cosine horizon 8,000 and minimum LR 1.0e-5.
 
+## GenomicBenchmarks
+
+All tasks use 10 epochs, AdamW, weight decay 0.01, split seeds 1--5, no
+orientation augmentation, and checkpoint selection by original-order
+validation accuracy.
+
+| Task | Public abbreviation | LR | Batch | Readout |
+|---|---|---:|---:|---|
+| `dummy_mouse_enhancers_ensembl` | ME | 1.0e-3 | 64 | pooled |
+| `demo_coding_vs_intergenomic_seqs` | CvI | 1.0e-3 | 256 | pooled |
+| `demo_human_or_worm` | HvW | 1.0e-3 | 256 | pooled |
+| `human_enhancers_cohn` | HE-C | 1.0e-3 | 256 | pooled |
+| `human_enhancers_ensembl` | HE-E | 5.0e-4 | 256 | pooled |
+| `human_ensembl_regulatory` | Reg. | 1.0e-3 | 256 | pooled |
+| `human_nontata_promoters` | Non-TATA | 1.5e-3 | 256 | pooled |
+| `human_ocr_ensembl` | OCR | 5.0e-4 | 256 | pooled, dropout 0.05 |
+
+The submitted aggregate uses completed formal task-wise configurations. Each
+individual run uses one original-order-validation-selected checkpoint for both
+evaluation views, but the two aggregate view rows are not a strictly paired
+orientation effect.
+
+## Causal-eQTL VEP
+
+- Frozen Flipped-GARI encoder: `d=192`, 12 blocks.
+- Primary downstream input: 131,072 bp.
+- Primary/pretraining-study readout: 1,536 bp centered on the variant.
+- Context-study readout: 1,024 bp for 1-, 16-, and 131-kb inputs.
+- Training subset: 5,000 sampled variants per distance stratum.
+- Probe seeds: 1--10 for primary studies.
+- Probe: `StandardScaler` followed by RBF-SVC.
+- Grid: `C in {0.1, 0.3, 1, 3, 5, 10, 30, 100}`.
+- Reported metric: hard-label AUROC.
+- Feature vector: reference and alternative pooled representations with tissue
+  covariates for the primary protocol.
+
+The retained VEP benchmark implementation selects the displayed setting from
+the evaluation grid for each stated condition. The component diagnostic
+transfers the original-order-selected setting unchanged to the
+sequence-reversed evaluation.
+
+## Direct 450-kb ETGP
+
+- Complete downstream input: 450,000 bp.
+- Full-backbone fine-tuning with activation checkpointing.
+- BF16, global batch 8, per-GPU microbatch 1.
+- AdamW betas `(0.9, 0.95)`, weight decay 0.1, clip 1.0.
+- Task-head peak LR: 6.0e-4.
+- Backbone LR: 6.0e-4 for 1 kb, 5.0e-5 for 2 kb, and 2.0e-5 for 5 kb.
+- Seeds: 2222 and 3333 where two-run summaries are available.
+- Metrics: AUROC and AUPRC from continuous scores over the complete split.
+
+The 1-kb result is the retained five-epoch run. The 2-kb and 5-kb results use
+validation-selected checkpoints from their completed direct runs. Their
+continuation and fine-tuning budgets differ, so they are descriptive context
+variants rather than a controlled context-length ablation.

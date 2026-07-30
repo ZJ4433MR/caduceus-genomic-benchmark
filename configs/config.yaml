@@ -29,6 +29,11 @@ train:
     bias_weight_decay: False
     normalization_weight_decay: False
 
+  # Optional lower learning rate for the pretrained sequence backbone. Newly
+  # initialized encoders/decoders continue to use optimizer.lr.
+  backbone_lr: null
+
+
   # These control state passing between batches
   state:
     mode: null # [ None | 'none' | 'reset' | 'bptt' | 'tbptt' ]

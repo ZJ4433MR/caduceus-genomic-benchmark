@@ -112,9 +112,10 @@ class _DNALongBenchBase(torch.utils.data.Dataset):
         use_padding=True,
         rc_aug=False,
         reverse_aug=False,
-        reverse_sequence=False,
-        conjoin_train=False,
-        conjoin_test=False,
+            reverse_sequence=False,
+            conjoin_train=False,
+            conjoin_test=False,
+            return_anchor_metadata=False,
     ):
         if tabix is None:
             raise ImportError("pytabix is required for DNALONGBENCH ETGP/eQTL datasets.") from _TABIX_IMPORT_ERROR
@@ -131,6 +132,7 @@ class _DNALongBenchBase(torch.utils.data.Dataset):
         self.reverse_sequence = reverse_sequence
         self.conjoin_train = conjoin_train
         self.conjoin_test = conjoin_test
+        self.return_anchor_metadata = return_anchor_metadata
         if self.rc_aug and self.reverse_aug:
             raise ValueError("`rc_aug` and `reverse_aug` are mutually exclusive for DNALONGBENCH datasets.")
         if (self.conjoin_train or self.conjoin_test) and self.reverse_aug:
@@ -288,11 +290,56 @@ class DNALongBenchETGPDataset(_DNALongBenchBase):
             Interval(row["region_chrom"], coords["sequence_start"], coords["sequence_end"])
         )
         sequence = self._mask_blacklist(row["region_chrom"], sequence, coords)
-        if coords["gene_start"] > coords["region_end_flank"]:
+        canonical_reverse_complement = coords["gene_start"] > coords["region_end_flank"]
+        sequence_length = min(len(sequence), self.max_length)
+        if self.return_anchor_metadata and (
+            self.reverse_aug
+            or self.reverse_sequence
+            or self.conjoin_train
+            or self.conjoin_test
+        ):
+            raise ValueError(
+                "Anchor metadata does not support plain reversal or RC conjoining."
+            )
+        if canonical_reverse_complement:
             sequence = string_reverse_complement(sequence)
+
+        tss_position = 0.5 * (coords["tss_start"] + coords["tss_end"]) - coords["sequence_start"]
+        enhancer_position = 0.5 * (
+            coords["region_start_flank"] + coords["region_end_flank"]
+        ) - coords["sequence_start"]
+        if canonical_reverse_complement:
+            tss_position = sequence_length - tss_position
+            enhancer_position = sequence_length - enhancer_position
+
+        # Apply RC augmentation before right-padding so anchor coordinates remain
+        # relative to the biological sequence rather than the padded 450 kb tensor.
+        sequence = sequence[: self.max_length]
+        if self.return_anchor_metadata:
+            if self.rc_aug and self.split == "train" and coin_flip():
+                sequence = string_reverse_complement(sequence)
+                tss_position = sequence_length - tss_position
+                enhancer_position = sequence_length - enhancer_position
+        else:
+            sequence = self._maybe_augment(sequence)
+
         sequence = self._pad_or_truncate(sequence)
-        sequence = self._maybe_augment(sequence)
-        return self._tokenize_with_optional_conjoin(sequence), self._target(row)
+        tokens = self._tokenize_with_optional_conjoin(sequence)
+        target = self._target(row)
+        if not self.return_anchor_metadata:
+            return tokens, target
+
+        # The ETGP filter guarantees both anchors are inside the extracted span. Clamp
+        # conservatively for records at a chromosome boundary.
+        upper = max(float(sequence_length) - 1.0, 0.0)
+        metadata = {
+            "tss_position": torch.tensor(min(max(tss_position, 0.0), upper), dtype=torch.float32),
+            "enhancer_position": torch.tensor(
+                min(max(enhancer_position, 0.0), upper), dtype=torch.float32
+            ),
+            "sequence_length": torch.tensor(sequence_length, dtype=torch.long),
+        }
+        return tokens, target, metadata
 
 
 class DNALongBenchEQTLDataset(_DNALongBenchBase):
@@ -310,6 +357,19 @@ class DNALongBenchEQTLDataset(_DNALongBenchBase):
         sequence = self.fasta_reader.extract(
             Interval(row["region_chrom"], coords["sequence_start"], coords["sequence_end"])
         )
+        canonical_reverse_complement = coords["gene_start"] > coords["region_end_flank"]
+        sequence_length = min(len(sequence), self.max_length)
+        if self.return_anchor_metadata and (
+            self.rc_aug
+            or self.reverse_aug
+            or self.reverse_sequence
+            or self.conjoin_train
+            or self.conjoin_test
+        ):
+            raise ValueError(
+                "Anchor metadata requires a fixed canonical orientation; disable "
+                "reverse/RC augmentation and conjoining."
+            )
         variant_start = int(row["region_start"])
         variant_end = int(row["region_end"])
         rel_start = variant_start - coords["sequence_start"]
@@ -324,7 +384,7 @@ class DNALongBenchEQTLDataset(_DNALongBenchBase):
 
         sequence = self._mask_blacklist(row["region_chrom"], sequence, coords)
         variant_sequence = sequence[:rel_start] + alt_allele + sequence[rel_end:]
-        if coords["gene_start"] > coords["region_end_flank"]:
+        if canonical_reverse_complement:
             sequence = string_reverse_complement(sequence)
             variant_sequence = string_reverse_complement(variant_sequence)
         sequence = self._pad_or_truncate(sequence)
@@ -335,10 +395,29 @@ class DNALongBenchEQTLDataset(_DNALongBenchBase):
         elif (self.rc_aug or self.conjoin_test) and self.split == "train" and coin_flip():
             sequence = string_reverse_complement(sequence)
             variant_sequence = string_reverse_complement(variant_sequence)
-        return torch.stack(
+        pair_tokens = torch.stack(
             [
                 self._tokenize_with_optional_conjoin(sequence),
                 self._tokenize_with_optional_conjoin(variant_sequence),
             ],
             dim=0,
-        ), self._target(row)
+        )
+        target = self._target(row)
+        if not self.return_anchor_metadata:
+            return pair_tokens, target
+
+        tss_position = 0.5 * (coords["tss_start"] + coords["tss_end"]) - coords["sequence_start"]
+        variant_position = 0.5 * (variant_start + variant_end) - coords["sequence_start"]
+        if canonical_reverse_complement:
+            tss_position = sequence_length - tss_position
+            variant_position = sequence_length - variant_position
+
+        upper = max(float(sequence_length) - 1.0, 0.0)
+        metadata = {
+            "tss_position": torch.tensor(min(max(tss_position, 0.0), upper), dtype=torch.float32),
+            "variant_position": torch.tensor(
+                min(max(variant_position, 0.0), upper), dtype=torch.float32
+            ),
+            "sequence_length": torch.tensor(sequence_length, dtype=torch.long),
+        }
+        return pair_tokens, target, metadata

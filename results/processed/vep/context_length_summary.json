@@ -1,0 +1,81 @@
+﻿{
+    "best_by_bucket":  [
+                           {
+                               "feature_mode":  "131k",
+                               "Distance to TSS":  "0 - 30k",
+                               "C":  0.1,
+                               "AUROC":  0.6572518300727164,
+                               "AUROC_std":  0.002945853492283867,
+                               "macro_AUROC_mean_over_buckets":  0.643214403416939
+                           },
+                           {
+                               "feature_mode":  "131k",
+                               "Distance to TSS":  "30 - 100k",
+                               "C":  5.0,
+                               "AUROC":  0.6308118916712379,
+                               "AUROC_std":  0.02709707868195725,
+                               "macro_AUROC_mean_over_buckets":  0.643214403416939
+                           },
+                           {
+                               "feature_mode":  "131k",
+                               "Distance to TSS":  "100k+",
+                               "C":  0.1,
+                               "AUROC":  0.6415794885068629,
+                               "AUROC_std":  0.0038478106025934913,
+                               "macro_AUROC_mean_over_buckets":  0.643214403416939
+                           },
+                           {
+                               "feature_mode":  "16k",
+                               "Distance to TSS":  "0 - 30k",
+                               "C":  0.3,
+                               "AUROC":  0.6634641423614591,
+                               "AUROC_std":  0.0045110912752876434,
+                               "macro_AUROC_mean_over_buckets":  0.6218996902649873
+                           },
+                           {
+                               "feature_mode":  "16k",
+                               "Distance to TSS":  "30 - 100k",
+                               "C":  3.0,
+                               "AUROC":  0.5877999563461748,
+                               "AUROC_std":  0.033560867896765434,
+                               "macro_AUROC_mean_over_buckets":  0.6218996902649873
+                           },
+                           {
+                               "feature_mode":  "16k",
+                               "Distance to TSS":  "100k+",
+                               "C":  30.0,
+                               "AUROC":  0.6144349720873278,
+                               "AUROC_std":  0.02014430467349154,
+                               "macro_AUROC_mean_over_buckets":  0.6218996902649873
+                           },
+                           {
+                               "feature_mode":  "1k",
+                               "Distance to TSS":  "0 - 30k",
+                               "C":  0.3,
+                               "AUROC":  0.6652609975993089,
+                               "AUROC_std":  0.0032850162297515593,
+                               "macro_AUROC_mean_over_buckets":  0.618465087371404
+                           },
+                           {
+                               "feature_mode":  "1k",
+                               "Distance to TSS":  "30 - 100k",
+                               "C":  3.0,
+                               "AUROC":  0.6127715813598167,
+                               "AUROC_std":  0.01663569013625006,
+                               "macro_AUROC_mean_over_buckets":  0.618465087371404
+                           },
+                           {
+                               "feature_mode":  "1k",
+                               "Distance to TSS":  "100k+",
+                               "C":  0.1,
+                               "AUROC":  0.5773626831550864,
+                               "AUROC_std":  0.003281425763947251,
+                               "macro_AUROC_mean_over_buckets":  0.618465087371404
+                           }
+                       ],
+    "macro_by_feature":  {
+                             "131k":  0.643214403416939,
+                             "16k":  0.6218996902649873,
+                             "1k":  0.618465087371404
+                         }
+}

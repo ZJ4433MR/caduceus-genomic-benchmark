@@ -1,11 +1,11 @@
-name: caduceus_env
+name: flipped-gari-aaai27
 channels:
   - pytorch
   - nvidia
-  - conda-forge 
+  - conda-forge
 dependencies:
   - cuda-nvcc=12.1.*
-  - python=3.8
+  - python=3.10.13
   - pytorch=2.2.0
   - torchaudio=2.2.0
   - torchvision=0.17.0
@@ -21,14 +21,12 @@ dependencies:
       - enformer-pytorch==0.8.8
       - fsspec==2023.10.0
       - genomic-benchmarks==0.0.9
-      - git-lfs==1.6
       - h5py==3.10.0
       - huggingface-hub==0.24.7
       - hydra-core==1.3.2
       - ipdb==0.13.13
       - matplotlib==3.7.4
-      - notebook==7.1.1
-      - nvitop==1.3.2
+      - numpy==1.24.4
       - omegaconf==2.3.0
       - pandas==2.0.3
       - pyfaidx==0.8.1.1

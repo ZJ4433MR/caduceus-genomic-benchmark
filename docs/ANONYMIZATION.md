@@ -1,19 +1,27 @@
-# Anonymization Notes
+# Anonymization
 
-This branch is intended for double-blind review.
+The AAAI reviewer artifact is built as a ZIP, not as a link to a source-control
+repository.
 
-The following items were removed or avoided:
+`scripts/build_anonymous_archive.py` excludes:
 
-- Author names and affiliations.
-- Personal usernames.
-- Private GitHub remotes.
-- Local absolute paths.
-- Private cluster home directories.
-- Weights and Biases account or project identifiers.
-- Internal progress reports and informal notes.
-- Git history from the development repository.
+- `.git` and other version-control metadata;
+- raw datasets, model checkpoints, caches, and generated outputs;
+- local build/staging directories;
+- files containing common access-token patterns;
+- files containing author names, local user profiles, cluster usernames, or
+  machine-specific absolute paths.
 
-Remaining external names refer to public third-party resources such as Caduceus,
-HyenaDNA, DNALongBench, GenomicBenchmarks, Nucleotide Transformer datasets, and
-Hugging Face model or dataset identifiers required for reproducibility.
+Official third-party dataset URLs and bibliographic identifiers remain in the
+archive because they identify external data sources rather than the authors.
 
+Before upload:
+
+```bash
+python scripts/validate_package.py
+python scripts/build_anonymous_archive.py
+```
+
+Inspect the resulting ZIP listing and the included
+`PACKAGE_MANIFEST.sha256`. Do not add a private repository URL, author contact,
+institution, acknowledgments, or non-anonymous checkpoint hosting location.

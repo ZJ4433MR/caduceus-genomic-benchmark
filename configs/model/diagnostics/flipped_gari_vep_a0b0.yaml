@@ -1,0 +1,8 @@
+# Component diagnostic: no cross-stream interaction, content fusion query.
+defaults:
+  - /model: flipped_gari_vep
+  - _self_
+enable_cross_attention: false
+discrepancy_mode: common_duplicate
+rope_interleaved: true
+zero_init_residual: true

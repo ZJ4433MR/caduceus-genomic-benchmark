@@ -1,0 +1,22 @@
+# Masked-nucleotide pretraining model for the ETGP profile.
+_name_: flipped_gari_lm
+vocab_size: 12
+d_model: 192
+n_layer: 13
+kernel_size: 4
+d_state: 16
+d_conv: 4
+expand: 2
+head_dim: 16
+dropout_rate1: 0.08
+num_heads: 3
+dropout_rate2: 0.08
+drop_path_rate: 0.18
+embed_dropout: 0.0
+pad_token_id: 4
+tie_embeddings: true
+cls_rope_mode: null
+enable_cross_attention: true
+discrepancy_mode: squared_difference
+rope_interleaved: false
+zero_init_residual: false

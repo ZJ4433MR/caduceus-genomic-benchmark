@@ -1,0 +1,4 @@
+pretraining_context_kb,n_runs,test_auroc_mean,test_auroc_sample_sd,test_auprc_mean,test_auprc_sample_sd
+1,1,0.8219230769,,0.4341083183,
+2,2,0.8225000000,0.0029916056,0.4197246977,0.0611591371
+5,2,0.8291346154,0.0099266914,0.4339200744,0.0128589813

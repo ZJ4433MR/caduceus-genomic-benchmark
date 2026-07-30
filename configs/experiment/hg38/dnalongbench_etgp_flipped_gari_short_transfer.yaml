@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - /pipeline: dnalongbench_450k
+  - /model: ???
+  - override /scheduler: proportional_cosine_warmup_timm
+
+dataset:
+  task_name: etgp
+  subset: null
+  train_len: 2066
+  max_length: 450000
+  batch_size: 1
+  batch_size_eval: 1
+  rc_aug: false
+  reverse_aug: false
+  conjoin_train: false
+  conjoin_test: false
+
+loader:
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+
+trainer:
+  max_epochs: 2
+  precision: bf16
+  gradient_clip_val: 1.0
+  num_sanity_val_steps: 0
+
+optimizer:
+  lr: 6e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+
+scheduler:
+  t_in_epochs: false
+  t_initial: 518
+  warmup_t: 78
+  warmup_lr_init_rate: 0.0016666666666666668
+  lr_min_rate: 0.1
+
+train:
+  seed: 3333
+  global_batch_size: 8
+  backbone_lr: ???
+  test: false

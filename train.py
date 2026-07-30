@@ -435,6 +435,50 @@ class SequenceLightningModule(pl.LightningModule):
         )
         return loss
 
+    def _debug_mlbn_nonfinite_state(self, stage):
+        """Emit a compact, opt-in tensor audit for short distributed smoke tests."""
+        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") != "1":
+            return
+        bad_parameters = []
+        bad_gradients = []
+        largest_gradients = []
+        for name, parameter in self.model.named_parameters():
+            if not torch.isfinite(parameter.detach()).all():
+                bad_parameters.append(name)
+            if parameter.grad is not None:
+                gradient = parameter.grad.detach()
+                if not torch.isfinite(gradient).all():
+                    bad_gradients.append(name)
+                else:
+                    largest_gradients.append((float(gradient.abs().max().cpu()), name))
+        largest_gradients.sort(reverse=True)
+        print(
+            "MLBN_NONFINITE_DEBUG "
+            + json.dumps(
+                {
+                    "stage": stage,
+                    "rank": int(self.global_rank),
+                    "global_step": int(self.global_step),
+                    "bad_parameters": bad_parameters[:100],
+                    "bad_gradients": bad_gradients[:100],
+                    "largest_gradient_max_abs": largest_gradients[:20],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def on_after_backward(self):
+        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") != "1":
+            return
+        self._mlbn_debug_backward_calls = getattr(self, "_mlbn_debug_backward_calls", 0) + 1
+        if self._mlbn_debug_backward_calls in {1, 2, 4, 8, 16, 24, 32, 64}:
+            self._debug_mlbn_nonfinite_state(f"after_backward_{self._mlbn_debug_backward_calls}")
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") == "1" and batch_idx in {31, 32, 63, 64}:
+            self._debug_mlbn_nonfinite_state(f"train_batch_end_{batch_idx}")
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # There's a bit of an annoying edge case with the first (0-th) epoch; it has to be excluded due to the initial
         # sanity check
@@ -461,6 +505,21 @@ class SequenceLightningModule(pl.LightningModule):
         # Set zero weight decay for some params
         if 'optimizer_param_grouping' in self.hparams.train:
             add_optimizer_hooks(self.model, **self.hparams.train.optimizer_param_grouping)
+
+        # Downstream adapters can require a substantially larger learning rate than
+        # a pretrained backbone. Merge this with any weight-decay overrides already
+        # attached by add_optimizer_hooks so both settings survive parameter grouping.
+        backbone_lr = self.hparams.train.get("backbone_lr", None)
+        if backbone_lr is not None:
+            backbone_lr = float(backbone_lr)
+            if backbone_lr <= 0.0:
+                raise ValueError(f"train.backbone_lr must be positive, got {backbone_lr}.")
+            for parameter in self.model.parameters():
+                if not parameter.requires_grad:
+                    continue
+                parameter_optim = dict(getattr(parameter, "_optim", {}))
+                parameter_optim["lr"] = backbone_lr
+                setattr(parameter, "_optim", parameter_optim)
 
         # Normal parameters
         all_params = list(self.parameters())

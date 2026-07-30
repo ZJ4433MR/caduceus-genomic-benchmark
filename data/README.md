@@ -1,30 +1,15 @@
-# Data Layout
+# Data Directory
 
-Large datasets are not stored in this repository.
+`manifests/datasets.csv` records every external dataset used by the artifact.
+Full third-party datasets are intentionally not redistributed.
 
-Expected local layout:
+Run the download commands in `REPRODUCE.md`; downloaded files are placed under
+`data/raw/` and ignored by Git.
 
-```text
-data/
-  hg38/
-    hg38.ml.fa
-    human-sequences.bed
-  genomic_benchmarks/
-    <GenomicBenchmarks task directories>
-  dnalongbench/
-    data_long_range_dna/
-      eQTL/
-      ETGP/
-```
+`synthetic/dna_classification.csv` is generated DNA-like text used only to
+exercise parsing and schema checks. It is not a subset of any benchmark and
+must not be used to reproduce reported metrics.
 
-Use the helper scripts where available:
-
-```bash
-bash scripts/download_hg38_pretrain_data.sh
-python scripts/download_dnalongbench_450k_data.py --help
-```
-
-The dataset manifest in `data/manifests/datasets.csv` records the dataset role,
-task type, sequence length, metric, and availability route expected by the
-paper.
-
+`representative/etgp_metadata_subset.tsv` is a six-row, CC0-licensed subset of
+the real DNALongBench ETGP metadata. It documents the true tabular schema but
+does not include the 450-kb sequence inputs.

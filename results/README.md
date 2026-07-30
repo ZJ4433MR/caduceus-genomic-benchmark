@@ -1,25 +1,17 @@
-# Result File Schema
+# Results
 
-Raw result CSV files should use long format:
+- `raw/` contains per-seed metrics or complete hyperparameter grids retained
+  from experiment outputs.
+- `processed/` contains table-ready summaries and explicit provenance labels.
+- `figures/` is reserved for plots regenerated from the processed CSV files.
 
-```text
-benchmark,task,model,comparison_role,pretrain_context,seed,orientation,metric,value
+No genomic sequence, embedding tensor, model checkpoint, or participant-level
+record is stored here.
+
+Run:
+
+```bash
+python scripts/verify_reported_results.py
 ```
 
-Recommended values:
-
-- `orientation`: `normal` or `flipped`.
-- `comparison_role`: `published_strong_baseline`, `same_budget_control`,
-  `ablation`, or `context_expert`.
-- `metric`: for example `accuracy`, `AUROC`, `AUPRC`, `MCC`, or `F1`.
-
-`scripts/aggregate_results.py` computes:
-
-- normal mean and standard deviation.
-- flipped mean and standard deviation.
-- drop = normal - flipped.
-- worst_case = min(normal, flipped).
-
-Keep seed-level raw files in `results/raw/` and generated paper tables in
-`results/tables/`.
-
+to recompute aggregate checks from these files.

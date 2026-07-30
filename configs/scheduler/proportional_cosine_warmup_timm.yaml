@@ -1,0 +1,10 @@
+# @package _global_
+train:
+  interval: step
+scheduler:
+  _name_: proportional_cosine_warmup_timm
+  t_in_epochs: false
+  t_initial: 300
+  lr_min_rate: 0.1
+  warmup_lr_init_rate: 0.0016666666666666668
+  warmup_t: 10

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download DNALONGBENCH ETGP/eQTL data from Harvard Dataverse.
+"""Download the DNALongBench ETGP data from Harvard Dataverse.
 
 The Dataverse file labels differ from the paths referenced by the benchmark
 configs for tabular files and fasta files. This downloader preserves the
@@ -24,7 +24,6 @@ from pathlib import Path
 DATAVERSE_API = "https://dataverse.harvard.edu/api"
 DATASETS = {
     "etgp": "doi:10.7910/DVN/CTEQXX",
-    "eqtl": "doi:10.7910/DVN/YUP2G5",
 }
 HEADERS = {"User-Agent": "Mozilla/5.0 DNALONGBENCH-downloader/1.0"}
 
@@ -121,15 +120,15 @@ def main():
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("data/dnalongbench/data_long_range_dna"),
+        default=Path("data/raw/dnalongbench"),
         help="Destination data root.",
     )
     parser.add_argument(
         "--tasks",
         nargs="+",
         choices=sorted(DATASETS),
-        default=["etgp", "eqtl"],
-        help="DNALONGBENCH 450k tasks to download.",
+        default=["etgp"],
+        help="DNALongBench tasks to download.",
     )
     parser.add_argument(
         "--no-decompress",
