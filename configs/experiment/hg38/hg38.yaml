@@ -16,7 +16,7 @@ trainer:
   num_nodes: 1
   accumulate_grad_batches: ${div_up:${train.global_batch_size}, ${eval:${trainer.devices} * ${dataset.batch_size} * ${trainer.num_nodes}}}
   max_epochs: null
-  max_steps: 10000
+  max_steps: 16000
   precision: 16  # bf16 only a100
   gradient_clip_val: 1.0
   limit_val_batches: 0.125
@@ -34,8 +34,8 @@ dataset:
   plain_flip_aug: false
   num_workers: 12
   use_fixed_len_val: false  # placing a fixed length val here, but it's really the test
-  mlm: false
-  mlm_probability: 0.0
+  mlm: true
+  mlm_probability: 0.15
 
 scheduler:
   t_in_epochs: False

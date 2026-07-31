@@ -24,12 +24,9 @@ trainer:
   devices: 1
   num_nodes: 1
   accumulate_grad_batches: ${div_up:${train.global_batch_size}, ${eval:${trainer.devices} * ${dataset.batch_size} * ${trainer.num_nodes}}}
-  max_epochs: 100
-  precision: 16  # bf16 only a100
+  max_epochs: 10
+  precision: 32
   gradient_clip_val: 1.0
-
-model:
-  _name_: dna_embedding
 
 dataset:
   # optional, default is max_length
@@ -51,7 +48,7 @@ optimizer:
 
 train:
   gpu_mem: ${eval:"round(float(__import__('subprocess').check_output('nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits', shell=True).strip().decode()) / 1000)"}
-  seed: 2222
+  seed: ???  # One of the five prescribed split seeds (1--5).
   global_batch_size: ${dataset.batch_size}
   cross_validation: true
   remove_test_loader_in_eval: true  # test only at the end of training

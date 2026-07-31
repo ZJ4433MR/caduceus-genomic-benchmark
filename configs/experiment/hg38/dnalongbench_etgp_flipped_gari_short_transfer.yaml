@@ -21,8 +21,19 @@ loader:
   pin_memory: true
   drop_last: false
 
+callbacks:
+  model_checkpoint_every_epoch:
+    monitor: null
+    save_top_k: -1
+    save_last: false
+    dirpath: checkpoints/
+    filename: epoch-{epoch}
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_epochs: 1
+
 trainer:
-  max_epochs: 2
+  max_epochs: 5
   precision: bf16
   gradient_clip_val: 1.0
   num_sanity_val_steps: 0
@@ -34,13 +45,13 @@ optimizer:
 
 scheduler:
   t_in_epochs: false
-  t_initial: 518
-  warmup_t: 78
+  t_initial: ${eval:${div_up:${dataset.train_len}, ${train.global_batch_size}} * ${trainer.max_epochs}}
+  warmup_t: ${eval:int(${div_up:${dataset.train_len}, ${train.global_batch_size}} * ${trainer.max_epochs} * 0.15)}
   warmup_lr_init_rate: 0.0016666666666666668
   lr_min_rate: 0.1
 
 train:
-  seed: 3333
+  seed: ???  # One of the two prescribed seeds: 2222 or 3333.
   global_batch_size: 8
   backbone_lr: ???
   test: false

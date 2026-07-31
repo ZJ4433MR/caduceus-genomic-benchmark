@@ -60,6 +60,7 @@ REQUIRED = (
     "scripts/launch/run_genomicbenchmarks.sh",
     "scripts/launch/run_vep.sh",
     "scripts/launch/run_etgp.sh",
+    "scripts/select_dnalongbench450k_epoch_by_global_val.py",
 )
 
 

@@ -4,7 +4,8 @@
 
 All profiles use AdamW with betas `(0.9, 0.95)`, weight decay 0.1,
 mask probability 0.15, no sequence-reversal augmentation, and no
-reverse-complement augmentation.
+reverse-complement augmentation. The released pretraining profiles use seed
+2222.
 
 | Profile | Context | d | Blocks | Steps | Peak LR | Warmup | Global / per-GPU batch | GPUs | Precision | Clip |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
@@ -55,20 +56,24 @@ orientation effect.
 The retained VEP benchmark implementation selects the displayed setting from
 the evaluation grid for each stated condition. The component diagnostic
 transfers the original-order-selected setting unchanged to the
-sequence-reversed evaluation.
+sequence-reversed evaluation. Its four cells are each pretrained once with
+seed 2222; SVC protocol seeds 1 and 2 reuse the fixed 5,000-example pool and
+therefore are protocol repeats rather than independent encoder replicates.
 
 ## Direct 450-kb ETGP
 
 - Complete downstream input: 450,000 bp.
 - Full-backbone fine-tuning with activation checkpointing.
 - BF16, global batch 8, per-GPU microbatch 1.
+- Five fine-tuning epochs for every context and seed.
 - AdamW betas `(0.9, 0.95)`, weight decay 0.1, clip 1.0.
 - Task-head peak LR: 6.0e-4.
-- Backbone LR: 6.0e-4 for 1 kb, 5.0e-5 for 2 kb, and 2.0e-5 for 5 kb.
-- Seeds: 2222 and 3333 where two-run summaries are available.
+- Backbone LR: 6.0e-4 at 1 kb, 5.0e-5 at 2 kb, and 2.0e-5 at 5 kb.
+- Scheduler: proportional cosine decay over all five epochs with 15% warmup.
+- Seeds: 2222 and 3333 for every context.
 - Metrics: AUROC and AUPRC from continuous scores over the complete split.
 
-The 1-kb result is the retained five-epoch run. The 2-kb and 5-kb results use
-validation-selected checkpoints from their completed direct runs. Their
-continuation and fine-tuning budgets differ, so they are descriptive context
-variants rather than a controlled context-length ablation.
+For each context and seed, the checkpoint with the highest full-split
+validation AUROC is selected and evaluated once on the test split. The two
+seed-level test metrics are summarized by their mean and sample standard
+deviation.

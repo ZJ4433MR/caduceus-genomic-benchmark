@@ -9,7 +9,7 @@ This file maps the affirmative checklist answers to concrete artifact paths.
 | Complete source code | `src/`, `caduceus/`, `train.py`, VEP and evaluation scripts |
 | Public source under research license | `LICENSE`, `THIRD_PARTY_NOTICES.md` |
 | Comments mapping implementation to paper | `docs/IMPLEMENTATION_MAP.md` plus symbol-level comments |
-| Random seeds | GB 1--5; VEP 1--10; ETGP 2222/3333 in configs, launchers, and `docs/HYPERPARAMETERS.md` |
+| Random seeds | Pretraining 2222; GB split seeds 1--5; VEP primary probe seeds 1--10; VEP diagnostic pretraining seed 2222 and SVC protocol seeds 1--2; ETGP 2222/3333 in configs, launchers, and `docs/HYPERPARAMETERS.md` |
 | Hardware/software requirements | `INSTALLATION.md`, `caduceus_env.yml`, `docs/HARDWARE.md` |
 | Evaluation code | GB evaluation scripts, `vep_svm_eval.py`, ETGP global-metric evaluator |
 | Number of runs | `docs/HYPERPARAMETERS.md` and the experiment launchers |
