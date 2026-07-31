@@ -25,7 +25,7 @@ from caduceus.configuration_caduceus import CaduceusConfig
 from caduceus.modeling_caduceus import Caduceus
 from src.models.sequence.long_conv_lm import LMBackbone
 from src.models.sequence.long_conv_lm import _init_weights
-from src.models.sequence.mlbn import MLBN_encoder
+from src.models.sequence.mlbn import FlippedGARIEncoder
 
 
 class DNAEmbeddingModel(nn.Module, GenerationMixin):
@@ -309,7 +309,10 @@ class DNAEmbeddingModelCaduceus(DNAEmbeddingModel):
 
 
 class DNAEmbeddingModelMLBN(nn.Module):
-    """DNA token embedding backbone using the MLBN bidirectional Mamba encoder."""
+    """Flipped-GARI DNA embedding backbone.
+
+    The legacy class name is retained for checkpoint compatibility.
+    """
 
     def __init__(
             self,
@@ -346,7 +349,7 @@ class DNAEmbeddingModelMLBN(nn.Module):
         self.conjoin_test = conjoin_test
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id, **factory_kwargs)
         self.embed_dropout = nn.Dropout(embed_dropout)
-        self.encoder = MLBN_encoder(
+        self.encoder = FlippedGARIEncoder(
             L=n_layer,
             input_dim=d_model,
             kernel_size=kernel_size,
@@ -387,7 +390,10 @@ class DNAEmbeddingModelMLBN(nn.Module):
 
 
 class MLBNLMHeadModel(nn.Module):
-    """MLBN masked/next-token language model for hg38 pre-training."""
+    """Flipped-GARI masked-nucleotide model for hg38 pretraining.
+
+    The legacy class name is retained for checkpoint compatibility.
+    """
 
     def __init__(
             self,
@@ -421,7 +427,7 @@ class MLBNLMHeadModel(nn.Module):
         self.vocab_size = vocab_size
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id, **factory_kwargs)
         self.embed_dropout = nn.Dropout(embed_dropout)
-        self.encoder = MLBN_encoder(
+        self.encoder = FlippedGARIEncoder(
             L=n_layer,
             input_dim=d_model,
             kernel_size=kernel_size,
@@ -455,6 +461,12 @@ class MLBNLMHeadModel(nn.Module):
     @property
     def d_output(self):
         return self.vocab_size
+
+
+# Public release names; legacy class names remain above so existing state
+# dictionaries and experiment checkpoints retain their original structure.
+DNAEmbeddingModelFlippedGARI = DNAEmbeddingModelMLBN
+FlippedGARILMHeadModel = MLBNLMHeadModel
 
 
 def load_backbone(model, state_dict, freeze_backbone=False, ignore_head=True):

@@ -8,16 +8,18 @@ therefore retain `MLBN` or `mlbn`:
 - `MLBN_encoder`
 - `DNAEmbeddingModelMLBN`
 - `MLBNLMHeadModel`
-- legacy registry keys `dna_embedding_mlbn` and `mlbn_lm`
-- compatibility aliases `--mlbn_config` and `--mlbn_checkpoint` for the public
-  VEP options `--flipped_gari_config` and `--flipped_gari_checkpoint`
 
-Renaming these serialized keys would break strict checkpoint provenance. The
-package adds public aliases:
+These names are internal compatibility identifiers, not a second model. The
+release exposes the following public names:
 
+- `FlippedGARIEncoder`
+- `DNAEmbeddingModelFlippedGARI`
+- `FlippedGARILMHeadModel`
 - `dna_embedding_flipped_gari`
 - `flipped_gari_lm`
 - `flipped-gari-local`
+- `--flipped_gari_config`
+- `--flipped_gari_checkpoint`
 
 The aliases instantiate exactly the same implementation and do not change
-model behavior.
+the module hierarchy, state-dict keys, or model behavior.

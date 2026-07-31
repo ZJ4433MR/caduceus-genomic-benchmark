@@ -435,9 +435,9 @@ class SequenceLightningModule(pl.LightningModule):
         )
         return loss
 
-    def _debug_mlbn_nonfinite_state(self, stage):
+    def _debug_flipped_gari_nonfinite_state(self, stage):
         """Emit a compact, opt-in tensor audit for short distributed smoke tests."""
-        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") != "1":
+        if os.environ.get("FLIPPED_GARI_DEBUG_NONFINITE", "0") != "1":
             return
         bad_parameters = []
         bad_gradients = []
@@ -453,7 +453,7 @@ class SequenceLightningModule(pl.LightningModule):
                     largest_gradients.append((float(gradient.abs().max().cpu()), name))
         largest_gradients.sort(reverse=True)
         print(
-            "MLBN_NONFINITE_DEBUG "
+            "FLIPPED_GARI_NONFINITE_DEBUG "
             + json.dumps(
                 {
                     "stage": stage,
@@ -469,15 +469,17 @@ class SequenceLightningModule(pl.LightningModule):
         )
 
     def on_after_backward(self):
-        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") != "1":
+        if os.environ.get("FLIPPED_GARI_DEBUG_NONFINITE", "0") != "1":
             return
-        self._mlbn_debug_backward_calls = getattr(self, "_mlbn_debug_backward_calls", 0) + 1
-        if self._mlbn_debug_backward_calls in {1, 2, 4, 8, 16, 24, 32, 64}:
-            self._debug_mlbn_nonfinite_state(f"after_backward_{self._mlbn_debug_backward_calls}")
+        self._flipped_gari_debug_backward_calls = getattr(self, "_flipped_gari_debug_backward_calls", 0) + 1
+        if self._flipped_gari_debug_backward_calls in {1, 2, 4, 8, 16, 24, 32, 64}:
+            self._debug_flipped_gari_nonfinite_state(
+                f"after_backward_{self._flipped_gari_debug_backward_calls}"
+            )
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if os.environ.get("MLBN_DEBUG_NONFINITE", "0") == "1" and batch_idx in {31, 32, 63, 64}:
-            self._debug_mlbn_nonfinite_state(f"train_batch_end_{batch_idx}")
+        if os.environ.get("FLIPPED_GARI_DEBUG_NONFINITE", "0") == "1" and batch_idx in {31, 32, 63, 64}:
+            self._debug_flipped_gari_nonfinite_state(f"train_batch_end_{batch_idx}")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # There's a bit of an annoying edge case with the first (0-th) epoch; it has to be excluded due to the initial

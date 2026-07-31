@@ -114,14 +114,11 @@ except ImportError:
     enformer_pytorch = None
 
 
-def is_mlbn_local(model_name_or_path: Optional[str]) -> bool:
+def is_flipped_gari_local(model_name_or_path: Optional[str]) -> bool:
     """Return true when using the local Flipped-GARI checkpoint loader."""
     return (model_name_or_path or "").lower() in {
         "flipped-gari-local",
         "flipped_gari_local",
-        "mlbn-local",
-        "mlbn_local",
-        "local-mlbn",
     }
 
 
@@ -259,7 +256,7 @@ class DNAEmbeddingModel(nn.Module):
         return self.backbone(input_ids).last_hidden_state
 
 
-class MLBNLocalEmbeddingModel(nn.Module):
+class FlippedGARILocalEmbeddingModel(nn.Module):
     """Local Flipped-GARI loader retaining legacy checkpoint key names."""
 
     def __init__(self, config_path: str, checkpoint_path: str):
@@ -271,9 +268,9 @@ class MLBNLocalEmbeddingModel(nn.Module):
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         config.pop("_name_", None)
-        from src.models.sequence.dna_embedding import DNAEmbeddingModelMLBN
+        from src.models.sequence.dna_embedding import DNAEmbeddingModelFlippedGARI
 
-        self.backbone = DNAEmbeddingModelMLBN(**config)
+        self.backbone = DNAEmbeddingModelFlippedGARI(**config)
         self._load_checkpoint(checkpoint_path)
 
     def _load_checkpoint(self, checkpoint_path: str):
@@ -839,10 +836,10 @@ def prepare_dataset(args, tokenizer):
 def get_backbone_model(args, device):
     """Get the backbone model."""
 
-    if is_mlbn_local(args.model_name_or_path):
-        model = MLBNLocalEmbeddingModel(
-            config_path=args.mlbn_config,
-            checkpoint_path=args.mlbn_checkpoint,
+    if is_flipped_gari_local(args.model_name_or_path):
+        model = FlippedGARILocalEmbeddingModel(
+            config_path=args.flipped_gari_config,
+            checkpoint_path=args.flipped_gari_checkpoint,
         )
     elif is_janusdna_local(args.model_name_or_path):
         model = JanusDNALocalEmbeddingModel(
@@ -1219,7 +1216,7 @@ def main(args):
     print(f"[RANK {dist.get_rank()}] Using device: {device}.")  # All processes print this
 
     # Init tokenizer
-    if is_mlbn_local(args.model_name_or_path) or is_janusdna_local(args.model_name_or_path):
+    if is_flipped_gari_local(args.model_name_or_path) or is_janusdna_local(args.model_name_or_path):
         tokenizer = CaduceusTokenizer(model_max_length=args.seq_len)
     elif "enformer" in args.model_name_or_path.lower():
         # Enformer tokenization requires having vocab of just `A,C,G,T,N` (in that order)
@@ -1264,9 +1261,9 @@ if __name__ == "__main__":
     parser.add_argument("--window_size_bp", type=int, default=1536,
                         help="Variant-centered readout width in base pairs. Use 1024 for the common-readout context study.")
     parser.add_argument("--model_name_or_path", type=str, default=None)
-    parser.add_argument("--flipped_gari_config", "--mlbn_config", dest="mlbn_config", type=str, default=None,
+    parser.add_argument("--flipped_gari_config", dest="flipped_gari_config", type=str, default=None,
                         help="Path to the local Flipped-GARI downstream config.")
-    parser.add_argument("--flipped_gari_checkpoint", "--mlbn_checkpoint", dest="mlbn_checkpoint", type=str, default=None,
+    parser.add_argument("--flipped_gari_checkpoint", dest="flipped_gari_checkpoint", type=str, default=None,
                         help="Path to the local Flipped-GARI checkpoint.")
     parser.add_argument("--janusdna_root", type=str, default=None,
                         help="Path to a local JanusDNA repository for model_name_or_path=janusdna-local.")

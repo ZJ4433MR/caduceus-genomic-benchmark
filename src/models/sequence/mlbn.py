@@ -1,8 +1,8 @@
-"""
-The model name is Mutual Learning Bidirectional Network, an encoder model.
-The model is based on the assumption that the output gap between forward and reverse chains in bidirectional neural
-networks is small under ideal conditions, we designed the Mutual Learning Bidirectional Network, a bidirectional neural
-network encoder architecture.
+"""Flipped-GARI sequence encoder and its reversal-aligned building blocks.
+
+Some internal class names are retained for compatibility with existing
+checkpoint state dictionaries. Public configurations and documentation use
+the Flipped-GARI name.
 """
 
 import math
@@ -21,16 +21,16 @@ except ImportError:
 
 
 def _make_mamba_mixer(input_dim, d_state, d_conv, expand, head_dim):
-    """Create the available Mamba mixer while preserving the MLBN interface."""
+    """Create the available Mamba mixer while preserving checkpoint compatibility."""
     if hasattr(mamba, "Mamba2"):
         return mamba.Mamba2(input_dim, d_state, d_conv, expand, head_dim)
     if Mamba1 is None:
-        raise ImportError("MLBN needs either mamba_ssm.Mamba2 or mamba_ssm.modules.mamba_simple.Mamba.")
+        raise ImportError("Flipped-GARI requires mamba_ssm.Mamba2 or mamba_ssm.modules.mamba_simple.Mamba.")
     return Mamba1(d_model=input_dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
 
 def _encoder_drop_path_rates(num_blocks: int, max_rate: float):
-    """Linear stochastic depth schedule (timm ViT style): 0 → max_rate across blocks."""
+    """Linear stochastic-depth schedule from zero to ``max_rate``."""
     if num_blocks <= 0:
         return []
     if max_rate <= 0.0:
@@ -40,76 +40,32 @@ def _encoder_drop_path_rates(num_blocks: int, max_rate: float):
     return [float(x) for x in torch.linspace(0, max_rate, num_blocks)]
 
 
-def _z4_raster_indices(seq_len: int, device, inverse: bool = False):
-    N = math.isqrt(seq_len)
-    if seq_len != N * N:
-        raise ValueError(f"Z4 GeneratorReindex requires square patch tokens; got seq_len={seq_len}")
-    idx = torch.arange(seq_len, device=device)
-    row = idx // N
-    col = idx % N
-    if inverse:
-        return (N - 1 - col) * N + row
-    return col * N + (N - 1 - row)
-
-
-def _reinsert_anchor(transformed_rest, anchor, anchor_idx: int):
-    if anchor_idx == 0:
-        return torch.cat([anchor, transformed_rest], dim=1)
-    if anchor_idx == transformed_rest.size(1):
-        return torch.cat([transformed_rest, anchor], dim=1)
-    return torch.cat(
-        [
-            transformed_rest[:, :anchor_idx, :],
-            anchor,
-            transformed_rest[:, anchor_idx:, :],
-        ],
-        dim=1,
-    )
-
-
 def generator_reindex(tensor, anchor_idx, n=2, inverse: bool = False):
-    if n not in {2, 4}:
-        raise ValueError(f"GeneratorReindex only supports n=2 or n=4; got n={n}")
-    if n == 2:
-        if anchor_idx is None:
-            return torch.flip(tensor, dims=[1])
-        seq_len = tensor.size(1)
-        if anchor_idx == 0:
-            anchor = tensor[:, :1, :]
-            rest = torch.flip(tensor[:, 1:, :], dims=[1])
-            return torch.cat([anchor, rest], dim=1)
-        if anchor_idx == seq_len - 1:
-            rest = torch.flip(tensor[:, :-1, :], dims=[1])
-            anchor = tensor[:, -1:, :]
-            return torch.cat([rest, anchor], dim=1)
-        left = torch.flip(tensor[:, :anchor_idx, :], dims=[1])
-        anchor = tensor[:, anchor_idx : anchor_idx + 1, :]
-        right = torch.flip(tensor[:, anchor_idx + 1 :, :], dims=[1])
-        return torch.cat([left, anchor, right], dim=1)
-
+    """Apply the reversal generator while preserving an optional anchor token."""
+    if n != 2:
+        raise ValueError(f"Flipped-GARI supports the reversal-induced Z2 action; got n={n}")
     if anchor_idx is None:
-        idx = _z4_raster_indices(tensor.size(1), tensor.device, inverse=inverse)
-        return tensor.index_select(1, idx)
+        return torch.flip(tensor, dims=[1])
     seq_len = tensor.size(1)
     anchor_idx = anchor_idx if anchor_idx >= 0 else seq_len + anchor_idx
     if anchor_idx < 0 or anchor_idx >= seq_len:
         raise ValueError(f"anchor_idx {anchor_idx} invalid for sequence length {seq_len}")
+    if anchor_idx == 0:
+        anchor = tensor[:, :1, :]
+        rest = torch.flip(tensor[:, 1:, :], dims=[1])
+        return torch.cat([anchor, rest], dim=1)
+    if anchor_idx == seq_len - 1:
+        rest = torch.flip(tensor[:, :-1, :], dims=[1])
+        anchor = tensor[:, -1:, :]
+        return torch.cat([rest, anchor], dim=1)
+    left = torch.flip(tensor[:, :anchor_idx, :], dims=[1])
     anchor = tensor[:, anchor_idx : anchor_idx + 1, :]
-    rest = torch.cat([tensor[:, :anchor_idx, :], tensor[:, anchor_idx + 1 :, :]], dim=1)
-    idx = _z4_raster_indices(rest.size(1), tensor.device, inverse=inverse)
-    transformed_rest = rest.index_select(1, idx)
-    return _reinsert_anchor(transformed_rest, anchor, anchor_idx)
+    right = torch.flip(tensor[:, anchor_idx + 1 :, :], dims=[1])
+    return torch.cat([left, anchor, right], dim=1)
 
 
 def maybe_compile(fn, compile_mode=None):
-    """
-    条件性地应用 torch.compile
-    Args:
-        fn: 要编译的函数或模块
-        compile_mode: 编译模式 ('default', 'reduce-overhead', 'max-autotune', None=不编译)
-    Returns:
-        编译后的函数或原函数
-    """
+    """Apply ``torch.compile`` when a compile mode is requested and available."""
     if compile_mode is None or not hasattr(torch, "compile"):
         return fn
     return torch.compile(fn, mode=compile_mode)
@@ -189,7 +145,7 @@ class MambaBlock(nn.Module):
         output:
             x: (2,batch_size,seq_len,input_dim)
         """
-        # 优化: 使用连续索引避免不必要的tensor拷贝
+        # Direct indexing avoids unnecessary tensor copies.
         x_f = self.forward_pipeline(x[0])
         x_b = self.backward_pipeline(x[1])
         return torch.stack([x_f, x_b], dim=0)
@@ -243,7 +199,7 @@ class GradientEquilibrium(nn.Module):
         """
         x_f, x_b = x[0], x[1]
 
-        # 优化: 使用 torch.linalg.vector_norm 替代手动计算，更快且数值稳定
+        # vector_norm is faster and more stable than a manual reduction.
         norm_f = torch.linalg.vector_norm(x_f) + self.eps
         norm_b = torch.linalg.vector_norm(x_b) + self.eps
 
@@ -307,16 +263,17 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = input_dim // num_heads
         self.input_dim = input_dim
-        # 分离 Q/K 和 V 的投影：Q/K 来自同一输入，V 来自另一输入
-        self.qk = nn.Linear(input_dim, input_dim * 2)  # Q 和 K
+        # Q/K share one source representation; V uses the other source.
+        self.qk = nn.Linear(input_dim, input_dim * 2)
         self.v = nn.Linear(input_dim, input_dim)  # V
         self.dropout = nn.Dropout(dropout_rate)
         self.norm = nn.LayerNorm(input_dim)
         self.use_rope = use_rope
         self.rope_base = rope_base
         self.cls_index = cls_index
-        # False preserves the positional convention used by existing MLBN
-        # checkpoints. New checkpoints can opt into the mathematically
+        # False preserves the positional convention used by existing
+        # Flipped-GARI checkpoints.
+        # New checkpoints can opt into the mathematically
         # consistent adjacent-pair convention used by _rotate_every_two.
         self.rope_interleaved = rope_interleaved
 
@@ -385,19 +342,19 @@ class Attention(nn.Module):
     def forward(self, x_qk, x_v):
         """
         input:
-            x_qk: (batch_size, seq_len, input_dim) - 用于生成 Q 和 K
-            x_v: (batch_size, seq_len, input_dim) - 用于生成 V
+            x_qk: (batch_size, seq_len, input_dim), source for Q and K
+            x_v: (batch_size, seq_len, input_dim), source for V
         output:
             attention: (batch_size, seq_len, input_dim)
         """
         batch_size, seq_len, _ = x_qk.shape
 
-        # 从 x_qk 生成 Q 和 K
+        # Generate Q and K from x_qk.
         qk = self.qk(x_qk).reshape(batch_size, seq_len, 2, self.num_heads, self.head_dim)
         q, k = qk.unbind(dim=2)
         q, k = q.transpose(1, 2), k.transpose(1, 2)  # (batch, heads, seq_len, head_dim)
 
-        # 从 x_v 生成 V
+        # Generate V from x_v.
         v = self.v(x_v).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.transpose(1, 2)  # (batch, heads, seq_len, head_dim)
 
@@ -405,11 +362,10 @@ class Attention(nn.Module):
         if self.use_rope:
             q, k = self._apply_rope(q, k)
 
-        # 使用 Flash Attention (PyTorch 2.0+, A800 GPU 自动启用)
-        # scaled_dot_product_attention 会自动选择最优实现:
-        # - Flash Attention (最快，需要 A100/A800/H100)
+        # PyTorch selects an available scaled-dot-product attention kernel.
+        # This may be Flash Attention on supported hardware.
         # - Memory-Efficient Attention
-        # - 标准数学实现
+        # - Standard mathematical implementation
         dropout_p = self.dropout.p if self.training else 0.0
 
         # Hybrid attention: Q/K from x_qk, V from x_v
@@ -421,7 +377,7 @@ class Attention(nn.Module):
             is_causal=False,
         )
 
-        # 转换回原始维度并投影
+        # Restore the original tensor layout.
         attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.input_dim)
         attn = self.norm(attn)
         out = self.dropout(attn)
@@ -455,7 +411,7 @@ class CrossAttention_pro(nn.Module):
         self.num_heads = num_heads
         self.head_dim = input_dim // num_heads
         self.input_dim = input_dim
-        # 优化: 合并 Q/K/V 投影为单个 Linear，减少 kernel 调用 (~5-10% 提速)
+        # A fused Q/K/V projection reduces kernel launches.
         self.qkv = nn.Linear(input_dim, input_dim * 3)
         self.dropout = nn.Dropout(dropout_rate)
         self.norm = nn.LayerNorm(input_dim)
@@ -535,11 +491,11 @@ class CrossAttention_pro(nn.Module):
         x_f, x_b = x[0], x[1]
         batch_size, seq_len, _ = x_f.shape
 
-        # 优化: 合并 QKV 投影，单次 Linear 计算后 split
+        # Project Q/K/V together, then split the result.
         qkv_f = self.qkv(x_f).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv_b = self.qkv(x_b).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
 
-        # 分离 Q, K, V 并转换维度: (batch, heads, seq_len, head_dim)
+        # Split Q, K, V and move heads before the sequence dimension.
         q_f, k_f, v_f = qkv_f.unbind(dim=2)
         q_b, k_b, v_b = qkv_b.unbind(dim=2)
         q_f, k_f, v_f = q_f.transpose(1, 2), k_f.transpose(1, 2), v_f.transpose(1, 2)
@@ -550,11 +506,10 @@ class CrossAttention_pro(nn.Module):
             q_f, k_f = self._apply_rope(q_f, k_f)
             q_b, k_b = self._apply_rope(q_b, k_b)
 
-        # 使用 Flash Attention (PyTorch 2.0+, A800 GPU 自动启用)
-        # scaled_dot_product_attention 会自动选择最优实现:
-        # - Flash Attention (最快，需要 A100/A800/H100)
+        # PyTorch selects an available scaled-dot-product attention kernel.
+        # This may be Flash Attention on supported hardware.
         # - Memory-Efficient Attention
-        # - 标准数学实现
+        # - Standard mathematical implementation
         dropout_p = self.dropout.p if self.training else 0.0
 
         # Cross attention: q_b attends to k_f, v_f
@@ -565,7 +520,7 @@ class CrossAttention_pro(nn.Module):
             dropout_p=dropout_p,
             is_causal=False,
         )
-        # Cross attention: q_f attends to k_b, v_b (使用相同的attention pattern)
+        # Reverse update uses the symmetric cross-stream pattern.
         attn_b = F.scaled_dot_product_attention(
             q_f,
             k_b,
@@ -647,15 +602,15 @@ class fusion_block(nn.Module):
         )
         self.Linear1 = nn.Linear(input_dim, input_dim)
         self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定性
+        # Separate normalization sites stabilize the residual paths.
         self.norm = nn.LayerNorm(input_dim)
         self.norm_add = nn.LayerNorm(input_dim)
         self.norm_sub = nn.LayerNorm(input_dim)
         self.norm_cross_attention = nn.LayerNorm(input_dim)
         self.norm_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向链
-        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
-        self.norm_after_odbc_b = nn.LayerNorm(input_dim)  # 后向链ODBC后正则化
+        # Normalize the canonical and flipped streams independently.
+        self.norm_after_odbc_f = nn.LayerNorm(input_dim)
+        self.norm_after_odbc_b = nn.LayerNorm(input_dim)
 
         if not self.enable_cross_attention:
             # Keep state_dict/total-parameter compatibility while making the
@@ -696,7 +651,7 @@ class fusion_block(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "qkv" in name:
-                    # QKV 合并层使用较小初始化避免注意力权重爆炸
+                    # Use a smaller gain for the fused QKV projection.
                     nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
@@ -732,7 +687,7 @@ class fusion_block(nn.Module):
 
     def _init_mamba_parameters(self):
         """Initialize Mamba related parameters"""
-        # 处理MambaBlock中的参数
+        # Initialize parameters in each shared Mamba pipeline.
         for pipeline_name in ["forward_pipeline", "backward_pipeline"]:
             if hasattr(self.MambaBlock, pipeline_name):
                 pipeline = getattr(self.MambaBlock, pipeline_name)
@@ -764,10 +719,10 @@ class fusion_block(nn.Module):
         """
         Tl_1p = self.norm(Tl_1)
         x = self.GELU(self.Linear1(Tl_1p))
-        # 优化: 使用简洁索引，避免不必要的tensor拷贝
+        # Direct indexing avoids unnecessary tensor copies.
         x_f, x_b = x[0], x[1].flip(1)
 
-        # ODBC with Norm - 优化: 使用 transpose 替代 permute（更快）
+        # Apply ODBC in channel-first layout.
         x_f = self.GELU(self.ODBC(x_f.transpose(1, 2)).transpose(1, 2))
         x_b = self.GELU(self.ODBC(x_b.transpose(1, 2)).transpose(1, 2))
 
@@ -780,7 +735,7 @@ class fusion_block(nn.Module):
         x = self.MambaBlock(x)
         x = self.GradientEquilibrium(x)
 
-        # CrossAttention with normalization - 标准 Pre-LN 残差连接
+        # Pre-normalized cross-stream residual update.
         x = torch.stack([x[0], x[1].flip(1)], dim=0)
         if self.enable_cross_attention:
             x = x + self.CrossAttention(self.norm_cross_attention(x))
@@ -798,8 +753,9 @@ class fusion_block(nn.Module):
 
 
 class MLBN(nn.Module):
-    """
-    Mutual Learning Bidirectional Network for sequence modeling
+    """One intermediate Flipped-GARI block.
+
+    The legacy class name is retained for checkpoint compatibility.
     """
 
     def __init__(
@@ -853,13 +809,13 @@ class MLBN(nn.Module):
         )
         self.Linear1 = nn.Linear(input_dim, input_dim)
         self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定性
+        # Separate normalization sites stabilize the residual paths.
         self.norm = nn.LayerNorm(input_dim)
         self.norm_cross_attention = nn.LayerNorm(input_dim)
         self.norm_after_cross_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向链
-        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # 前向链ODBC后正则化
-        self.norm_after_odbc_b = nn.LayerNorm(input_dim)  # 后向链ODBC后正则化
+        # Normalize the canonical and flipped streams independently.
+        self.norm_after_odbc_f = nn.LayerNorm(input_dim)
+        self.norm_after_odbc_b = nn.LayerNorm(input_dim)
 
         if not self.enable_cross_attention:
             self.CrossAttention.requires_grad_(False)
@@ -898,7 +854,7 @@ class MLBN(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "qkv" in name:
-                    # QKV 合并层使用较小初始化避免注意力权重爆炸
+                    # Use a smaller gain for the fused QKV projection.
                     nn.init.xavier_uniform_(module.weight, gain=0.5)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
@@ -935,7 +891,7 @@ class MLBN(nn.Module):
 
     def _init_mamba_parameters(self):
         """Initialize Mamba related parameters"""
-        # 处理MambaBlock中的参数
+        # Initialize parameters in each shared Mamba pipeline.
         for pipeline_name in ["forward_pipeline", "backward_pipeline"]:
             if hasattr(self.MambaBlock, pipeline_name):
                 pipeline = getattr(self.MambaBlock, pipeline_name)
@@ -967,10 +923,10 @@ class MLBN(nn.Module):
         """
         Tl_1p = self.norm(Tl_1)
         x = self.GELU(self.Linear1(Tl_1p))
-        # 优化: 使用简洁索引，避免不必要的tensor拷贝
+        # Direct indexing avoids unnecessary tensor copies.
         x_f, x_b = x[0], x[1].flip(1)
 
-        # ODBC with Norm - 优化: 使用 transpose 替代 permute（更快）
+        # Apply ODBC in channel-first layout.
         x_f = self.GELU(self.ODBC(x_f.transpose(1, 2)).transpose(1, 2))
         x_b = self.GELU(self.ODBC(x_b.transpose(1, 2)).transpose(1, 2))
 
@@ -983,7 +939,7 @@ class MLBN(nn.Module):
         x = self.MambaBlock(x)
         x = self.GradientEquilibrium(x)
 
-        # CrossAttention with normalization - 标准 Pre-LN 残差连接
+        # Pre-normalized cross-stream residual update.
         x = torch.stack([x[0], x[1].flip(1)], dim=0)
         if self.enable_cross_attention:
             x = x + self.CrossAttention(self.norm_cross_attention(x))
@@ -1012,11 +968,11 @@ class MLBN(nn.Module):
     def get_parameter_details(self):
         """Get detailed parameter breakdown by layer"""
         details = {}
-        seen_params = set()  # 用于去重参数（避免共享模块重复计数）
+        seen_params = set()
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重）
+                # Count shared parameters only once.
                 module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
@@ -1032,7 +988,7 @@ class MLBN(nn.Module):
     def summary(self):
         """Print detailed model summary"""
         print(f"\n{'=' * 60}")
-        print("MLBN Model Summary")
+        print("Flipped-GARI Block Summary")
         print(f"{'=' * 60}")
 
         # Basic parameter counts
@@ -1075,8 +1031,9 @@ class MLBN(nn.Module):
 
 
 class MLBN_encoder(nn.Module):
-    """
-    Mutual Learning Bidirectional Network encoder
+    """Flipped-GARI sequence encoder.
+
+    The legacy class name is retained for checkpoint compatibility.
     """
 
     def __init__(
@@ -1100,16 +1057,16 @@ class MLBN_encoder(nn.Module):
         zero_init_residual: bool = False,
     ):
         """
-        L: number of MLBN blocks to stack
-        Other parameters: same as MLBN
-        input_dim: 推荐128,192,256,512
-        kernel_size: 推荐4,8
-        d_state: 推荐16,32
-        d_conv: 推荐与kernel_size相同
-        expand: 推荐2,4,8
+        L: number of intermediate Flipped-GARI blocks to stack
+        Other parameters: shared block and terminal-fusion settings
+        input_dim: hidden-state dimension
+        kernel_size: ODBC kernel width
+        d_state: Mamba state dimension
+        d_conv: Mamba convolution width
+        expand: Mamba expansion factor
         Attention:input_dim*expand/head_dim is 8's multiple,input_dim must be divisible by num_heads
         cls_rope_mode: None,first,last
-        drop_path_rate: max stochastic depth; linear 0→max over L MLBN blocks + fusion block (timm ViT)
+        drop_path_rate: max stochastic depth; linear 0 to max over L blocks plus terminal fusion
         """
         super().__init__()
         self.checkpoint_blocks = checkpoint_blocks
@@ -1192,7 +1149,7 @@ class MLBN_encoder(nn.Module):
             for name, module in block.named_modules():
                 if isinstance(module, nn.Linear):
                     if "qkv" in name:
-                        # QKV 合并层使用较小初始化避免注意力权重爆炸
+                        # Use a smaller gain for the fused QKV projection.
                         nn.init.xavier_uniform_(module.weight, gain=0.5 * residual_scale)
                         if module.bias is not None:
                             nn.init.zeros_(module.bias)
@@ -1213,7 +1170,7 @@ class MLBN_encoder(nn.Module):
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
 
-        print("MLBN_encoder weights initialization completed")
+        print("Flipped-GARI encoder weight initialization completed")
 
     def _init_encoder_mamba_parameters(self):
         """Initialize Mamba related parameters in the encoder"""
@@ -1263,11 +1220,11 @@ class MLBN_encoder(nn.Module):
     def get_parameter_details(self):
         """Get detailed parameter breakdown by layer"""
         details = {}
-        seen_params = set()  # 用于去重参数（避免共享模块重复计数）
+        seen_params = set()
 
         for name, module in self.named_modules():
             if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重）
+                # Count shared parameters only once.
                 module_params = 0
                 for param in module.parameters():
                     param_id = id(param)
@@ -1283,13 +1240,13 @@ class MLBN_encoder(nn.Module):
         for i, block in enumerate(self.blocks):
             block_param_count = sum(p.numel() for p in block.parameters())
             block_params.append(block_param_count)
-            details[f"MLBN_block_{i}"] = block_param_count
+            details[f"flipped_gari_block_{i}"] = block_param_count
         return details
 
     def summary(self):
         """Print detailed model summary"""
         print(f"\n{'=' * 60}")
-        print(f"MLBN Encoder Summary (L={len(self.blocks)})")
+        print(f"Flipped-GARI Encoder Summary (L={len(self.blocks)})")
         print(f"{'=' * 60}")
 
         # Basic parameter counts
@@ -1306,12 +1263,11 @@ class MLBN_encoder(nn.Module):
 
         # Component details
         print("\nComponents:")
-        print(f"  - Number of MLBN blocks: {len(self.blocks)}")
+        print(f"  - Number of Flipped-GARI blocks: {len(self.blocks)}")
         for i, block in enumerate(self.blocks):
             block_params = sum(p.numel() for p in block.parameters())
             print(f"    - Block {i}: {block_params:,} parameters")
-        print("  - FeatureWeightedFusion: enabled")
-        print("  - MultiScaleFeatureEnhancer: enabled")
+        print("  - Discrepancy-aware terminal fusion: enabled")
 
         # Parameter breakdown
         print("\nParameter Breakdown:")
@@ -1352,725 +1308,8 @@ class MLBN_encoder(nn.Module):
         return x
 
 
-class vision_fusion_block(nn.Module):
-    """
-    Vision Fusion Layer: 融合前向和后向分支，考虑 anchor token 的特殊处理
-    """
-
-    def __init__(
-        self,
-        input_dim,
-        kernel_size,
-        d_state,
-        d_conv,
-        expand,
-        head_dim,
-        dropout_rate1,
-        num_heads,
-        dropout_rate2,
-        cls_rope_mode=None,
-        drop_path_rate: float = 0.0,
-        n: int = 2,
-    ):
-        """
-        input_dim: input dimension
-        kernel_size: kernel size
-        d_state: state dimension
-        d_conv: convolution dimension
-        expand: expand factor
-        head_dim: head dimension
-        dropout_rate1: MambaBlock dropout rate
-        num_heads: head number
-        dropout_rate2: CrossAttention dropout rate
-        cls_rope_mode: CLS token position mode for RoPE
-        drop_path_rate: stochastic depth on residual branch (timm / ViT style)
-        """
-        super().__init__()
-        if n not in {2, 4}:
-            raise ValueError(f"vision_fusion_block only supports n=2 or n=4; got n={n}")
-        self.n = n
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        self.ODBC = ODBC(input_dim, kernel_size)
-        self.MambaBlock = MambaBlock(
-            input_dim,
-            d_state,
-            d_conv,
-            expand,
-            head_dim,
-            dropout_rate1,
-        )
-        self.GradientEquilibrium = GradientEquilibrium()
-        self.cls_rope_mode_cfg = cls_rope_mode
-        self.CrossAttention = CrossAttention_pro(input_dim, num_heads, dropout_rate2, cls_index=self.cls_rope_mode_cfg)
-        self.Attention = Attention(input_dim, num_heads, dropout_rate2, cls_index=self.cls_rope_mode_cfg)
-        self.Linear1 = nn.Linear(input_dim, input_dim)
-        self.Linear2 = nn.Linear(input_dim, input_dim)
-        # 添加多个Norm层以提高训练稳定性
-        self.norm = nn.LayerNorm(input_dim)
-        self.norm_add = nn.LayerNorm(input_dim)
-        self.norm_sub = nn.LayerNorm(input_dim)
-        self.norm_cross_attention = nn.LayerNorm(input_dim)
-        self.norm_attention = nn.LayerNorm(input_dim)
-        # 分别正则化前向和后向链
-        self.norm_after_odbc_f = nn.LayerNorm(input_dim)
-        self.norm_after_odbc_b = nn.LayerNorm(input_dim)
-
-        self.GELU = nn.GELU()
-        # Initialize parameters
-        self.apply_initialization()
-
-    def _resolve_anchor_index(self, seq_len):
-        mode = self.cls_rope_mode_cfg
-        if mode is None:
-            return None
-        if isinstance(mode, str):
-            m = mode.lower()
-            if m in {"first", "cls", "head"}:
-                return 0
-            if m in {"last", "tail"}:
-                return seq_len - 1
-            if m in {"medium", "middle", "mid"}:
-                return seq_len // 2
-            if m in {"none", "off"}:
-                return None
-            raise ValueError(f"Unsupported cls_rope_mode: {mode}")
-        idx = mode if mode >= 0 else seq_len + mode
-        if idx < 0 or idx >= seq_len:
-            raise ValueError(f"cls_rope_mode index {mode} invalid for sequence length {seq_len}")
-        return idx
-
-    @staticmethod
-    def GeneratorReindex(tensor, anchor_idx, n=2, inverse: bool = False):
-        return generator_reindex(tensor, anchor_idx, n=n, inverse=inverse)
-
-    def _init_weights(self):
-        """Initialize weights"""
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                if "qkv" in name or "qk" in name:
-                    nn.init.xavier_uniform_(module.weight, gain=0.5)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-                else:
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.Conv1d):
-                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        # Special initialization
-        nn.init.xavier_uniform_(self.ODBC.conv.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.Linear1.weight, gain=1.0)
-        if self.Linear1.bias is not None:
-            nn.init.zeros_(self.Linear1.bias)
-        nn.init.xavier_uniform_(self.Linear2.weight, gain=1.0)
-        if self.Linear2.bias is not None:
-            nn.init.zeros_(self.Linear2.bias)
-
-    def _init_mamba_parameters(self):
-        """Initialize Mamba related parameters"""
-        for pipeline_name in ["forward_pipeline", "backward_pipeline"]:
-            if hasattr(self.MambaBlock, pipeline_name):
-                pipeline = getattr(self.MambaBlock, pipeline_name)
-                for module in pipeline.modules():
-                    if hasattr(module, "__class__") and "Mamba2" in str(module.__class__):
-                        self._init_single_mamba2(module, pipeline_name)
-
-    def _init_single_mamba2(self, mamba_module, pipeline_name):
-        """Initialize special parameters for a single Mamba2 module"""
-        if hasattr(mamba_module, "A_log"):
-            with torch.no_grad():
-                mamba_module.A_log.data.uniform_(-4.0, -1.5)
-
-    def apply_initialization(self):
-        """Apply custom initialization"""
-        self._init_weights()
-        self._init_mamba_parameters()
-
-    def forward(self, Tl_1):
-        """
-        input:
-        Tl_1: (2,batch_size,seq_len,input_dim)
-        output:
-        x: (batch_size,seq_len,input_dim) - 融合后的单个特征
-        """
-        Tl_1p = self.norm(Tl_1)
-        x = self.GELU(self.Linear1(Tl_1p))
-        seq_len = x.size(2)
-        anchor_idx = self._resolve_anchor_index(seq_len)
-        x_f = x[0, :, :, :]
-        x_b = self.GeneratorReindex(x[1, :, :, :], anchor_idx, n=self.n, inverse=False)
-
-        # ODBC with Norm
-        x_f = self.GELU(torch.permute(self.ODBC(torch.permute(x_f, dims=[0, 2, 1])), dims=[0, 2, 1]))
-        x_b = self.GELU(torch.permute(self.ODBC(torch.permute(x_b, dims=[0, 2, 1])), dims=[0, 2, 1]))
-
-        # Normalize forward and backward chains separately
-        x_f = self.norm_after_odbc_f(x_f)
-        x_b = self.norm_after_odbc_b(x_b)
-        x = torch.stack([x_f, x_b], dim=0)
-
-        # MambaBlock with normalization
-        x = self.MambaBlock(x)
-        x = self.GradientEquilibrium(x)
-
-        # CrossAttention with normalization - 标准 Pre-LN 残差连接
-        x = torch.stack(
-            [x[0, :, :, :], self.GeneratorReindex(x[1, :, :, :], anchor_idx, n=self.n, inverse=True)],
-            dim=0,
-        )
-        x = x + self.CrossAttention(self.norm_cross_attention(x))
-
-        # 融合和差特征
-        x_add, x_sub = self.norm_add(x[0] + x[1]), self.norm_sub(-((x[0] - x[1]) ** 2))
-        x = self.norm_attention(self.Attention(x_sub, x_add)) + x_add
-        delta = self.GELU(self.Linear2(x))
-        x = Tl_1[0] + self.drop_path(delta)
-        return x
-
-
-class VisionMLBN(nn.Module):
-    """
-    Mutual Learning Bidirectional Network for vision modeling
-    """
-
-    def __init__(
-        self,
-        input_dim,
-        kernel_size,
-        d_state,
-        d_conv,
-        expand,
-        head_dim,
-        dropout_rate1,
-        num_heads,
-        dropout_rate2,
-        cls_rope_mode=None,
-        drop_path_rate: float = 0.0,
-        n: int = 2,
-    ):
-        """
-        input_dim: input dimension
-        kernel_size: kernel size
-        d_state1: forward state dimension
-        d_state2: backward state dimension
-        d_conv1: forward convolution dimension
-        d_conv2: backward convolution dimension
-        expand: expand factor
-        head_dim:head dimension
-        dropout_rate1: MambaBlock dropout rate
-        num_heads: head number
-        dropout_rate2: CrossAttention dropout rate
-        drop_path_rate: stochastic depth on residual branch (timm / ViT style)
-        """
-        super().__init__()
-        if n not in {2, 4}:
-            raise ValueError(f"VisionMLBN only supports n=2 or n=4; got n={n}")
-        self.n = n
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        self.ODBC = ODBC(input_dim, kernel_size)
-        self.MambaBlock = MambaBlock(
-            input_dim,
-            d_state,
-            d_conv,
-            expand,
-            head_dim,
-            dropout_rate1,
-        )
-        self.GradientEquilibrium = GradientEquilibrium()
-        self.cls_rope_mode_cfg = cls_rope_mode
-        self.CrossAttention = CrossAttention_pro(input_dim, num_heads, dropout_rate2, cls_index=self.cls_rope_mode_cfg)
-        self.Linear1 = nn.Linear(input_dim, input_dim)
-        self.Linear2 = nn.Linear(input_dim, input_dim)
-
-        # Add multiple Norm layers to improve training stability
-        self.norm = nn.LayerNorm(input_dim)
-        self.norm_cross_attention = nn.LayerNorm(input_dim)
-        self.norm_after_cross_attention = nn.LayerNorm(input_dim)
-        # Normalize forward and backward chains separately
-        self.norm_after_odbc_f = nn.LayerNorm(input_dim)  # Forward chain ODBC after normalization
-        self.norm_after_odbc_b = nn.LayerNorm(input_dim)  # Backward chain ODBC after normalization
-
-        self.GELU = nn.GELU()
-        # Initialize parameters
-        self.apply_initialization()
-
-    def _resolve_anchor_index(self, seq_len):
-        mode = self.cls_rope_mode_cfg
-        if mode is None:
-            return None
-        if isinstance(mode, str):
-            m = mode.lower()
-            if m in {"first", "cls", "head"}:
-                return 0
-            if m in {"last", "tail"}:
-                return seq_len - 1
-            if m in {"medium", "middle", "mid"}:
-                return seq_len // 2
-            if m in {"none", "off"}:
-                return None
-            raise ValueError(f"Unsupported cls_rope_mode: {mode}")
-        idx = mode if mode >= 0 else seq_len + mode
-        if idx < 0 or idx >= seq_len:
-            raise ValueError(f"cls_rope_mode index {mode} invalid for sequence length {seq_len}")
-        return idx
-
-    @staticmethod
-    def GeneratorReindex(tensor, anchor_idx, n=2, inverse: bool = False):
-        return generator_reindex(tensor, anchor_idx, n=n, inverse=inverse)
-
-    def _init_weights(self):
-        """Custom weights initialization"""
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                if "qkv" in name:
-                    # QKV 合并层初始化
-                    nn.init.xavier_uniform_(module.weight, gain=0.5)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-                else:
-                    # Other linear layers initialization
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.LayerNorm):
-                # LayerNorm initialization
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.Conv1d):
-                # 1D convolution layer initialization
-                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        # Special initialization: ODBC conv layers use smaller initialization to prevent gradient explosion
-        nn.init.xavier_uniform_(self.ODBC.conv.weight, gain=0.1)
-
-        # Linear1 layer: use Xavier initialization (now with GELU)
-        nn.init.xavier_uniform_(self.Linear1.weight, gain=1.0)
-        if self.Linear1.bias is not None:
-            nn.init.zeros_(self.Linear1.bias)
-
-    def _init_mamba_parameters(self):
-        """Initialize Mamba related parameters"""
-        # Process MambaBlock parameters
-        for pipeline_name in ["forward_pipeline", "backward_pipeline"]:
-            if hasattr(self.MambaBlock, pipeline_name):
-                pipeline = getattr(self.MambaBlock, pipeline_name)
-
-                # Traverse all Mamba2 modules in the pipeline
-                for module in pipeline.modules():
-                    if hasattr(module, "__class__") and "Mamba2" in str(module.__class__):
-                        self._init_single_mamba2(module, pipeline_name)
-
-    def _init_single_mamba2(self, mamba_module, pipeline_name):
-        """Initialize special parameters for single Mamba2 module"""
-        # A matrix: state transition matrix
-        if hasattr(mamba_module, "A_log"):
-            with torch.no_grad():
-                # Use uniform initialization range
-                mamba_module.A_log.data.uniform_(-4.0, -1.5)
-
-    def apply_initialization(self):
-        """Apply custom initialization"""
-        self._init_weights()
-        self._init_mamba_parameters()
-
-    def forward(self, Tl_1):
-        """
-        input:
-        Tl_1: (2,batch_size,seq_len,input_dim)
-        output:
-        Tl: (2,batch_size,seq_len,input_dim)
-        """
-        Tl_1p = self.norm(Tl_1)
-        x = self.GELU(self.Linear1(Tl_1p))
-        seq_len = x.size(2)
-        anchor_idx = self._resolve_anchor_index(seq_len)
-        x_f = x[0, :, :, :]
-        x_b = self.GeneratorReindex(x[1, :, :, :], anchor_idx, n=self.n, inverse=False)
-
-        # ODBC with Norm
-        x_f = self.GELU(torch.permute(self.ODBC(torch.permute(x_f, dims=[0, 2, 1])), dims=[0, 2, 1]))
-        x_b = self.GELU(torch.permute(self.ODBC(torch.permute(x_b, dims=[0, 2, 1])), dims=[0, 2, 1]))
-
-        # Normalize forward and backward chains separately
-        x_f = self.norm_after_odbc_f(x_f)
-        x_b = self.norm_after_odbc_b(x_b)
-        x = torch.stack([x_f, x_b], dim=0)
-
-        # MambaBlock with normalization
-        x = self.MambaBlock(x)
-        x = self.GradientEquilibrium(x)
-
-        # CrossAttention with normalization - 标准 Pre-LN 残差连接
-        x = torch.stack(
-            [x[0, :, :, :], self.GeneratorReindex(x[1, :, :, :], anchor_idx, n=self.n, inverse=True)],
-            dim=0,
-        )
-        x = x + self.CrossAttention(self.norm_cross_attention(x))
-        delta = self.Linear2(self.norm_after_cross_attention(x))
-        Tl = Tl_1 + self.drop_path(delta)
-        return Tl
-
-    def get_parameter_count(self):
-        """Get total number of parameters"""
-        return sum(p.numel() for p in self.parameters())
-
-    def get_trainable_parameter_count(self):
-        """Get number of trainable parameters"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def get_parameter_size_mb(self):
-        """Get parameter size in MB"""
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
-        return param_size / (1024 * 1024)
-
-    def get_trainable_parameter_size_mb(self):
-        """Get trainable parameter size in MB"""
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters() if p.requires_grad)
-        return param_size / (1024 * 1024)
-
-    def get_parameter_details(self):
-        """Get detailed parameter breakdown by layer"""
-        details = {}
-        seen_params = set()  # 用于去重参数（避免共享模块重复计数）
-
-        for name, module in self.named_modules():
-            if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重）
-                module_params = 0
-                for param in module.parameters():
-                    param_id = id(param)
-                    if param_id not in seen_params:
-                        seen_params.add(param_id)
-                        module_params += param.numel()
-
-                if module_params > 0:
-                    details[name] = module_params
-
-        return details
-
-    def summary(self):
-        """Print detailed model summary"""
-        print(f"\n{'=' * 60}")
-        print("Vision_MLBN Model Summary")
-        print(f"{'=' * 60}")
-
-        # Basic parameter counts
-        total_params = self.get_parameter_count()
-        trainable_params = self.get_trainable_parameter_count()
-        total_size_mb = self.get_parameter_size_mb()
-        trainable_size_mb = self.get_trainable_parameter_size_mb()
-
-        print(f"Total Parameters: {total_params:,}")
-        print(f"Trainable Parameters: {trainable_params:,}")
-        print(f"Non-trainable Parameters: {total_params - trainable_params:,}")
-        print(f"Parameter Size: {total_size_mb:.2f} MB")
-        print(f"Trainable Size: {trainable_size_mb:.2f} MB")
-
-        # Component details
-        print("\nComponents:")
-        print(f"  - ODBC: {self.ODBC.input_dim} -> {self.ODBC.input_dim}")
-        print("  - MambaBlock: bidirectional")
-        print(f"    - d_state: {self.MambaBlock.forward_pipeline[0].d_state}")
-        print(f"    - d_conv: {self.MambaBlock.forward_pipeline[0].d_conv}")
-        print(f"    - expand: {self.MambaBlock.forward_pipeline[0].expand}")
-        print("  - GradientEquilibrium: enabled")
-        print(f"  - CrossAttention: {self.CrossAttention.num_heads} heads")
-        print(f"    - head_dim: {self.CrossAttention.head_dim}")
-
-        # Parameter breakdown
-        print("\nParameter Breakdown:")
-        details = self.get_parameter_details()
-        for name, params in sorted(details.items(), key=lambda x: abs(x[1]), reverse=True):
-            if params != 0:
-                print(f"  - {name}: {params:,}")
-
-        # Model configuration
-        print("\nModel Configuration:")
-        print(f"  - Input dim: {self.ODBC.input_dim}")
-        print(f"  - Kernel size: {self.ODBC.kernel_size}")
-        print(f"  - Dropout rates: {self.MambaBlock.forward_pipeline[1].p}")
-
-        print(f"{'=' * 60}")
-
-
-class VisionMLBN_encoder(nn.Module):
-    """
-    Mutual Learning Bidirectional Network encoder for vision modeling
-    """
-
-    def __init__(
-        self,
-        L,
-        input_dim,
-        kernel_size,
-        d_state,
-        d_conv,
-        expand,
-        head_dim,
-        dropout_rate1,
-        num_heads,
-        dropout_rate2,
-        cls_rope_mode=None,
-        drop_path_rate: float = 0.0,
-        n: int = 2,
-    ):
-        """
-        L: number of VisionMLBN blocks to stack
-        Other parameters: same as VisionMLBN
-        input_dim: 推荐128,192,256,512
-        kernel_size: 推荐4,8
-        d_state: 推荐16,32
-        d_conv: 推荐与kernel_size相同
-        expand: 推荐2,4,8
-        Attention:input_dim*expand/head_dim is 8's multiple,input_dim must be divisible by num_heads
-        cls_rope_mode: None,first,last
-        drop_path_rate: max stochastic depth; linear 0→max over L VisionMLBN blocks + fusion block (timm ViT)
-        """
-        super().__init__()
-        if n not in {2, 4}:
-            raise ValueError(f"VisionMLBN_encoder only supports n=2 or n=4; got n={n}")
-        self.cls_rope_mode = cls_rope_mode
-        self.n = n
-        num_blocks = L + 1
-        dpr = _encoder_drop_path_rates(num_blocks, drop_path_rate)
-        self.blocks = nn.ModuleList(
-            [
-                VisionMLBN(
-                    input_dim,
-                    kernel_size,
-                    d_state,
-                    d_conv,
-                    expand,
-                    head_dim,
-                    dropout_rate1,
-                    num_heads,
-                    dropout_rate2,
-                    cls_rope_mode=self.cls_rope_mode,
-                    drop_path_rate=dpr[i],
-                    n=self.n,
-                )
-                for i in range(L)
-            ]
-            + [
-                vision_fusion_block(
-                    input_dim,
-                    kernel_size,
-                    d_state,
-                    d_conv,
-                    expand,
-                    head_dim,
-                    dropout_rate1,
-                    num_heads,
-                    dropout_rate2,
-                    cls_rope_mode=self.cls_rope_mode,
-                    drop_path_rate=dpr[L],
-                    n=self.n,
-                )
-            ]
-        )
-        # depth-aware init for GradientEquilibrium
-        for i, block in enumerate(self.blocks):
-            if hasattr(block, "GradientEquilibrium") and hasattr(block.GradientEquilibrium, "set_depth"):
-                block.GradientEquilibrium.set_depth(
-                    layer_idx=i,
-                    num_layers=len(self.blocks),
-                    tighten=0.0,
-                    beta_floor=math.log(10.0),
-                )
-
-        # 双向输出融合层：(2, B, L, D) -> (B, L, D)
-        self.fusion_linear = nn.Linear(2 * input_dim, input_dim)
-        self.fusion_activation = nn.GELU()
-        self.fusion_norm = nn.LayerNorm(input_dim)
-
-        # Initialize parameters for all blocks
-        self.apply_encoder_initialization()
-
-    def _init_encoder_weights(self):
-        """Custom encoder weights initialization"""
-        for i, block in enumerate(self.blocks):
-            # Apply residual scaling for deeper layers to prevent gradient vanishing
-            residual_scale = 0.1 ** (i / len(self.blocks))  # Gradually smaller initialization
-
-            for name, module in block.named_modules():
-                if isinstance(module, nn.Linear):
-                    if "qkv" in name:
-                        # QKV 合并层初始化
-                        nn.init.xavier_uniform_(module.weight, gain=0.5 * residual_scale)
-                        if module.bias is not None:
-                            nn.init.zeros_(module.bias)
-                    else:
-                        # Other linear layers initialization
-                        nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                        if module.bias is not None:
-                            nn.init.zeros_(module.bias)
-
-                elif isinstance(module, nn.LayerNorm):
-                    # LayerNorm initialization
-                    nn.init.ones_(module.weight)
-                    nn.init.zeros_(module.bias)
-
-                elif isinstance(module, nn.Conv1d):
-                    # 1D convolution layer initialization
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-
-        # 初始化融合层
-        nn.init.xavier_uniform_(self.fusion_linear.weight, gain=1.0)
-        if self.fusion_linear.bias is not None:
-            nn.init.zeros_(self.fusion_linear.bias)
-        nn.init.ones_(self.fusion_norm.weight)
-        nn.init.zeros_(self.fusion_norm.bias)
-
-    def _init_encoder_mamba_parameters(self):
-        """Initialize Mamba parameters in encoder"""
-        for i, block in enumerate(self.blocks):
-            # Process MambaBlock parameters in each block
-            for pipeline_name in ["forward_pipeline", "backward_pipeline"]:
-                if hasattr(block.MambaBlock, pipeline_name):
-                    pipeline = getattr(block.MambaBlock, pipeline_name)
-
-                    # Traverse all Mamba2 modules in the pipeline
-                    for module in pipeline.modules():
-                        if hasattr(module, "__class__") and "Mamba2" in str(module.__class__):
-                            self._init_single_mamba2_encoder(module, pipeline_name, i)
-
-    def _init_single_mamba2_encoder(self, mamba_module, pipeline_name, block_idx):
-        """Initialize special parameters for single Mamba2 module in encoder"""
-        # A matrix: state transition matrix, adjust initialization based on block depth
-        if hasattr(mamba_module, "A_log"):
-            with torch.no_grad():
-                # Deep blocks use more stable initialization
-                depth_factor = 0.1 ** (block_idx / max(1, len(self.blocks)))
-                mamba_module.A_log.data.uniform_(-4.0 * depth_factor, -1.5 * depth_factor)
-
-    def apply_encoder_initialization(self):
-        """Apply encoder custom initialization"""
-        self._init_encoder_weights()
-        self._init_encoder_mamba_parameters()
-
-    def get_parameter_count(self):
-        """Get total number of parameters"""
-        return sum(p.numel() for p in self.parameters())
-
-    def get_trainable_parameter_count(self):
-        """Get number of trainable parameters"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def get_parameter_size_mb(self):
-        """Get parameter size in MB"""
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
-        return param_size / (1024 * 1024)
-
-    def get_trainable_parameter_size_mb(self):
-        """Get trainable parameter size in MB"""
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters() if p.requires_grad)
-        return param_size / (1024 * 1024)
-
-    def get_parameter_details(self):
-        """Get detailed parameter breakdown by layer"""
-        details = {}
-        seen_params = set()  # 用于去重参数（避免共享模块重复计数）
-
-        for name, module in self.named_modules():
-            if len(list(module.children())) == 0:  # Leaf modules only
-                # 只统计该模块独有的参数（去重）
-                module_params = 0
-                for param in module.parameters():
-                    param_id = id(param)
-                    if param_id not in seen_params:
-                        seen_params.add(param_id)
-                        module_params += param.numel()
-
-                if module_params > 0:
-                    details[name] = module_params
-
-        # Calculate parameters per block
-        block_params = []
-        for i, block in enumerate(self.blocks):
-            block_param_count = sum(p.numel() for p in block.parameters())
-            block_params.append(block_param_count)
-            details[f"VisionMLBN_block_{i}"] = block_param_count
-
-        # Add encoder-level components
-        if hasattr(self, "FeatureWeightedFusion"):
-            fusion_params = sum(p.numel() for p in self.FeatureWeightedFusion.parameters())
-            details["FeatureWeightedFusion"] = fusion_params
-
-        if hasattr(self, "multi_scale_enhancer"):
-            enhancer_params = sum(p.numel() for p in self.multi_scale_enhancer.parameters())
-            details["MultiScaleFeatureEnhancer"] = enhancer_params
-
-        return details
-
-    def summary(self):
-        """Print detailed model summary"""
-        print(f"\n{'=' * 60}")
-        print(f"VisionMLBN Encoder Summary (L={len(self.blocks)})")
-        print(f"{'=' * 60}")
-
-        # Basic parameter counts
-        total_params = self.get_parameter_count()
-        trainable_params = self.get_trainable_parameter_count()
-        total_size_mb = self.get_parameter_size_mb()
-        trainable_size_mb = self.get_trainable_parameter_size_mb()
-
-        print(f"Total Parameters: {total_params:,}")
-        print(f"Trainable Parameters: {trainable_params:,}")
-        print(f"Non-trainable Parameters: {total_params - trainable_params:,}")
-        print(f"Parameter Size: {total_size_mb:.2f} MB")
-        print(f"Trainable Size: {trainable_size_mb:.2f} MB")
-
-        # Component details
-        print("\nComponents:")
-        print(f"  - Number of VisionMLBN blocks: {len(self.blocks)}")
-        for i, block in enumerate(self.blocks):
-            block_params = sum(p.numel() for p in block.parameters())
-            print(f"    - Block {i}: {block_params:,} parameters")
-        print("  - FeatureWeightedFusion: enabled")
-        print("  - MultiScaleFeatureEnhancer: enabled")
-
-        # Parameter breakdown
-        print("\nParameter Breakdown:")
-        details = self.get_parameter_details()
-        for name, params in sorted(details.items(), key=lambda x: x[1], reverse=True):
-            if params > 0:
-                print(f"  - {name}: {params:,}")
-
-        # Model configuration
-        if len(self.blocks) > 0:
-            first_block = self.blocks[0]
-            print("\nModel Configuration:")
-            print(f"  - Input dim: {first_block.ODBC.input_dim}")
-            print(f"  - Kernel size: {first_block.ODBC.kernel_size}")
-            print(f"  - d_state: {first_block.MambaBlock.forward_pipeline[0].d_state}")
-            print(f"  - d_conv: {first_block.MambaBlock.forward_pipeline[0].d_conv}")
-            print(f"  - expand: {first_block.MambaBlock.forward_pipeline[0].expand}")
-
-        print(f"{'=' * 60}")
-
-    def forward(self, x):
-        """
-        input:
-            x: (2, batch_size, seq_len, input_dim)
-        output:
-            x: (batch_size, seq_len, input_dim)
-        """
-        # x = torch.stack([x, x], dim=0)
-        # new version x:(2,batch_size, seq_len, input_dim)
-        for block in self.blocks:
-            x = block(x)
-        return x
+# Public names used by the paper and release configs. The aliases preserve the
+# module structure and state-dict keys of existing experimental checkpoints.
+FlippedGARIBlock = MLBN
+FlippedGARITerminalFusion = fusion_block
+FlippedGARIEncoder = MLBN_encoder
