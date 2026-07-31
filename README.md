@@ -53,6 +53,10 @@ compatibility with checkpoints produced before the public model name was fixed.
 All user-facing configurations use **Flipped-GARI**. See
 [docs/LEGACY_IDENTIFIERS.md](docs/LEGACY_IDENTIFIERS.md).
 
+The `configs/` directory contains only the Flipped-GARI experiment profiles
+and the Hydra dependencies required to compose those profiles. Baseline and
+unused framework configurations are intentionally excluded.
+
 ## Artifact Boundary
 
 This package covers the experiments described in the submitted paper and

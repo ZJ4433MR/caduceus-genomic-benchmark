@@ -5,7 +5,7 @@ defaults:
   - /dataset: genomic_benchmark
   - /task: multiclass_classification
   - /optimizer: adamw
-  - /scheduler: plateau
+  - /scheduler: cosine_warmup_timm
   - /callbacks: [base, checkpoint]
 
 train:

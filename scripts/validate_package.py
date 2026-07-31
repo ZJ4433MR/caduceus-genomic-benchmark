@@ -47,6 +47,13 @@ REQUIRED = (
     "configs/model/flipped_gari_gb.yaml",
     "configs/model/flipped_gari_vep.yaml",
     "configs/model/flipped_gari_etgp.yaml",
+    "configs/model/flipped_gari_lm_gb.yaml",
+    "configs/model/flipped_gari_lm_vep.yaml",
+    "configs/model/flipped_gari_lm_etgp.yaml",
+    "configs/model/diagnostics/flipped_gari_vep_a0b0.yaml",
+    "configs/model/diagnostics/flipped_gari_vep_a0b1.yaml",
+    "configs/model/diagnostics/flipped_gari_vep_a1b0.yaml",
+    "configs/model/diagnostics/flipped_gari_vep_a1b1.yaml",
     "results/README.md",
     "scripts/build_anonymous_archive.py",
     "scripts/launch/pretrain_flipped_gari.sh",
@@ -123,11 +130,35 @@ def validate_csv(errors: list[str]) -> None:
         )
 
 
+def validate_config_dependencies(errors: list[str]) -> None:
+    """Ensure every concrete Hydra defaults reference resolves in the package."""
+    default_pattern = re.compile(r"^\s*-\s+(?:override\s+)?/([^:]+):\s*([^#]+)")
+    for config_path in (ROOT / "configs").rglob("*.yaml"):
+        for line in config_path.read_text(encoding="utf-8-sig").splitlines():
+            match = default_pattern.match(line)
+            if not match:
+                continue
+            group, raw_names = match.groups()
+            raw_names = raw_names.strip()
+            if raw_names in {"???", "null"}:
+                continue
+            if raw_names.startswith("[") and raw_names.endswith("]"):
+                names = [name.strip() for name in raw_names[1:-1].split(",")]
+            else:
+                names = [raw_names]
+            for name in names:
+                dependency = ROOT / "configs" / group / f"{name}.yaml"
+                if not dependency.is_file():
+                    relative = config_path.relative_to(ROOT)
+                    errors.append(f"missing Hydra dependency for {relative}: {dependency.relative_to(ROOT)}")
+
+
 def main() -> None:
     errors: list[str] = []
     validate_required(errors)
     validate_files(errors)
     validate_csv(errors)
+    validate_config_dependencies(errors)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

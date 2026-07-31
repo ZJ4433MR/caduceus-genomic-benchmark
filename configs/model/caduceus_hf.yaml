@@ -1,9 +1,0 @@
-# Hugging Face Caduceus backbone for downstream fine-tuning.
-_name_: dna_embedding_caduceus
-hf_model_name_or_path: kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16
-trust_remote_code: true
-cache_dir: null
-revision: null
-local_files_only: false
-conjoin_train: false
-conjoin_test: false
